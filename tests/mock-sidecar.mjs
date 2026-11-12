@@ -7,6 +7,8 @@
 //     -> emits a `message` event to the client (tests the listen path)
 //   emit_message_attachments {thread_id, sender_id, message_id, attachments:[...], sticker_id, sticker_url}
 //     -> emits a `message_attachments` event (late rows for an already-emitted message)
+//   members -> fixed test-group roster with names (tests the sender-name cache)
+//   send_file {thread_id, file_path, filename, mime_type, text} -> {event:"sent", otid}
 //   crash -> exits with code 1 (tests the client's auto-restart)
 //
 // Usage: node tests/mock-sidecar.mjs
@@ -75,15 +77,37 @@ rl.on("line", (line) => {
       if (!loggedIn) {
         return send({ event: "error", ok: false, id, cmd: "send", error: "not logged in" });
       }
-      if (!cmd.text) {
-        return send({ event: "error", ok: false, id, cmd: "send", error: "send requires text" });
+      if (!cmd.text && !cmd.sticker_id) {
+        return send({ event: "error", ok: false, id, cmd: "send", error: "send requires text or sticker_id" });
       }
       if (!cmd.thread_id) {
         return send({ event: "error", ok: false, id, cmd: "send", error: "send requires thread_id" });
       }
-      lastSend = { thread_id: cmd.thread_id, text: cmd.text, is_e2ee: !!cmd.is_e2ee, reply_to: cmd.reply_to ?? null, reply_to_sender_id: cmd.reply_to_sender_id ?? null };
+      lastSend = { thread_id: cmd.thread_id, text: cmd.text ?? "", is_e2ee: !!cmd.is_e2ee, reply_to: cmd.reply_to ?? null, reply_to_sender_id: cmd.reply_to_sender_id ?? null, sticker_id: cmd.sticker_id ?? null };
       return send({ event: "sent", ok: true, otid: Date.now(), thread_id: cmd.thread_id, is_e2ee: !!cmd.is_e2ee, id });
     }
+    case "send_file": {
+      if (!loggedIn) {
+        return send({ event: "error", ok: false, id, cmd: "send_file", error: "not logged in" });
+      }
+      if (!cmd.file_path) {
+        return send({ event: "error", ok: false, id, cmd: "send_file", error: "send_file requires file_path" });
+      }
+      lastSend = { thread_id: cmd.thread_id, text: cmd.text ?? "", file_path: cmd.file_path, filename: cmd.filename ?? null, mime_type: cmd.mime_type ?? null, reply_to: cmd.reply_to ?? null };
+      return send({ event: "sent", ok: true, otid: Date.now(), thread_id: cmd.thread_id, id });
+    }
+    case "members":
+      // Fixed roster mirroring the real test group (two accounts share
+      // the name "Dương Tuấn Phong" — the mention-dedupe case).
+      return send({
+        event: "members", ok: true,
+        members: [
+          { user_id: 61596150664551, name: "Luminous Marble" },
+          { user_id: 100077686061735, name: "Dương Tuấn Phong" },
+          { user_id: 61568473919027, name: "Dương Tuấn Phong" },
+        ],
+        id,
+      });
     case "disconnect":
       return send({ event: "disconnected", ok: true, id });
     case "emit_disconnected":

@@ -284,6 +284,26 @@ export class GatewayDatabaseClient implements DatabaseService {
     }
   }
 
+  // Dedup claims + sender names never lived in D1 (the worker has no
+  // endpoints for them) — they use the local SQLite file, same as typing
+  // mode / presence above. A rollback to the gateway keeps dedup working
+  // because the claim store is local, not in D1.
+  async claimMessageSeen(messageId: string, threadId: string): Promise<boolean> {
+    return this.local.claimMessageSeen(messageId, threadId);
+  }
+
+  async getSenderName(senderId: string): Promise<string | null> {
+    return this.local.getSenderName(senderId);
+  }
+
+  async getSenderNames(senderIds: string[]): Promise<Map<string, string>> {
+    return this.local.getSenderNames(senderIds);
+  }
+
+  async cacheSenderNames(entries: Array<{ senderId: string; name: string }>): Promise<void> {
+    await this.local.cacheSenderNames(entries);
+  }
+
   async recordBotMessage(messageId: string, threadId: string): Promise<void> {
     try {
       await this.request<{ success: boolean }>("/bot-messages", {
@@ -344,13 +364,16 @@ export class GatewayDatabaseClient implements DatabaseService {
     await this.local.setPresenceEnabled(enabled);
   }
 
-  async purgeOldMessages(olderThanTimestamp: number): Promise<{ deletedMessages?: number; deletedBot?: number }> {
+  async purgeOldMessages(olderThanTimestamp: number): Promise<{ deletedMessages?: number; deletedBot?: number; deletedSeen?: number }> {
     try {
       const res = await this.request<any>("/purge", {
         method: "POST",
         body: JSON.stringify({ older_than: olderThanTimestamp }),
       });
-      return res;
+      // Dedup claims live in the local SQLite file (see above) — purge
+      // them here too, since the worker knows nothing about them.
+      const local = await this.local.purgeOldMessages(olderThanTimestamp);
+      return { ...res, deletedSeen: local.deletedSeen };
     } catch (err: any) {
       logger.error({ err: err.message }, "Failed to purge old messages");
       return {};
@@ -383,6 +406,8 @@ export class InMemoryDatabase implements DatabaseService {
   private globalBlacklist = new Set<string>();
   private messages: MessageRecord[] = [];
   private botMessages = new Set<string>();
+  private seenIds = new Set<string>();
+  private senderNames = new Map<string, string>();
   private selfThreadId: string | null = null;
   private presenceEnabled = true;
 
@@ -570,6 +595,31 @@ export class InMemoryDatabase implements DatabaseService {
   async getRecentMessages(threadId: string, limit: number = config.historyLimit): Promise<MessageRecord[]> {
     const filtered = this.messages.filter((m) => m.thread_id === threadId);
     return filtered.slice(-limit);
+  }
+
+  async claimMessageSeen(messageId: string): Promise<boolean> {
+    if (this.seenIds.has(messageId)) return false;
+    this.seenIds.add(messageId);
+    return true;
+  }
+
+  async getSenderName(senderId: string): Promise<string | null> {
+    return this.senderNames.get(senderId) ?? null;
+  }
+
+  async getSenderNames(senderIds: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (const id of senderIds) {
+      const name = this.senderNames.get(id);
+      if (name) out.set(id, name);
+    }
+    return out;
+  }
+
+  async cacheSenderNames(entries: Array<{ senderId: string; name: string }>): Promise<void> {
+    for (const e of entries) {
+      if (e.senderId && e.name && e.name.trim()) this.senderNames.set(e.senderId, e.name.trim());
+    }
   }
 
   async recordBotMessage(messageId: string): Promise<void> {

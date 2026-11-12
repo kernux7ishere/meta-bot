@@ -35,13 +35,30 @@ function parseSources(raw: string | null | undefined): string[] {
 }
 
 export class SqliteDatabaseClient implements DatabaseService {
-  private db: DatabaseSync;
+  private explicitDb: DatabaseSync | null = null;
 
   /** Pass a DatabaseSync to use it (tests use :memory:); otherwise the
    *  shared singleton connection from sqlite-conn.ts. */
   constructor(db?: DatabaseSync) {
-    this.db = db ?? getConnection();
-    initSchema(this.db);
+    if (db) {
+      this.explicitDb = db;
+      initSchema(db);
+    }
+    // No eager getConnection(): the shared connection is resolved
+    // lazily through the `db` getter below, so a later
+    // setConnectionForTests swap is picked up instead of holding a
+    // closed handle (proven 2026-11-12: §28 swapped the shared
+    // connection to memDb, closing the one this client had captured,
+    // and every global-`db` call after it failed silently — the
+    // recordBotMessage ERRORs in the §31/§34 logs were exactly this).
+  }
+
+  /** The connection this client writes through: an explicitly passed db
+   *  (tests), or the current shared connection — resolved lazily on
+   *  every access. getConnection() itself runs initSchema, so the
+   *  schema is always present. */
+  private get db(): DatabaseSync {
+    return this.explicitDb ?? getConnection();
   }
 
   // -- Thread settings -------------------------------------------------
@@ -329,9 +346,22 @@ export class SqliteDatabaseClient implements DatabaseService {
 
   async saveMessage(msg: MessageRecord): Promise<void> {
     try {
+      // ON CONFLICT DO UPDATE (not INSERT OR REPLACE): REPLACE deletes
+      // the old row and inserts a new one, which changes rowid — and
+      // getRecentMessages breaks created_at ties by rowid, so a
+      // re-save could reorder history. DO UPDATE keeps the original
+      // rowid and only refreshes the columns.
       this.db
         .prepare(
-          "INSERT OR REPLACE INTO messages (id, thread_id, sender_id, sender_name, body, reply_to_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+          `INSERT INTO messages (id, thread_id, sender_id, sender_name, body, reply_to_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             thread_id = excluded.thread_id,
+             sender_id = excluded.sender_id,
+             sender_name = excluded.sender_name,
+             body = excluded.body,
+             reply_to_id = excluded.reply_to_id,
+             created_at = excluded.created_at`
         )
         .run(
           msg.id,
@@ -344,6 +374,56 @@ export class SqliteDatabaseClient implements DatabaseService {
         );
     } catch (err: any) {
       logger.error({ err: err.message, msgId: msg.id }, "Failed to save message to SQLite");
+    }
+  }
+
+  async claimMessageSeen(messageId: string, threadId: string): Promise<boolean> {
+    try {
+      const res = this.db
+        .prepare(
+          "INSERT INTO seen_messages (id, thread_id, seen_at) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING"
+        )
+        .run(messageId, threadId, Date.now());
+      return Number(res.changes) > 0;
+    } catch (err: any) {
+      // Fail OPEN: a dedup-store glitch must never drop a message.
+      // Worst case is a duplicate reply — the old behaviour.
+      logger.error({ err: err.message, messageId }, "Failed to claim message id, treating as new");
+      return true;
+    }
+  }
+
+  async getSenderName(senderId: string): Promise<string | null> {
+    const names = await this.getSenderNames([senderId]);
+    return names.get(senderId) ?? null;
+  }
+
+  async getSenderNames(senderIds: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    const ids = [...new Set(senderIds.filter(Boolean))];
+    if (ids.length === 0) return out;
+    try {
+      const rows = this.db
+        .prepare(`SELECT sender_id, name FROM sender_names WHERE sender_id IN (${ids.map(() => "?").join(",")})`)
+        .all(...ids) as Array<{ sender_id: string; name: string }>;
+      for (const r of rows) out.set(r.sender_id, r.name);
+    } catch (err: any) {
+      logger.error({ err: err.message }, "Failed to read sender names");
+    }
+    return out;
+  }
+
+  async cacheSenderNames(entries: Array<{ senderId: string; name: string }>): Promise<void> {
+    const usable = entries.filter((e) => e.senderId && e.name && e.name.trim());
+    if (usable.length === 0) return;
+    try {
+      const upsert = this.db.prepare(
+        "INSERT INTO sender_names (sender_id, name, updated_at) VALUES (?, ?, ?) ON CONFLICT(sender_id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at"
+      );
+      const now = Date.now();
+      for (const e of usable) upsert.run(e.senderId, e.name.trim(), now);
+    } catch (err: any) {
+      logger.error({ err: err.message }, "Failed to cache sender names");
     }
   }
 
@@ -420,13 +500,16 @@ export class SqliteDatabaseClient implements DatabaseService {
 
   // -- Maintenance -------------------------------------------------------
 
-  async purgeOldMessages(olderThanTimestamp: number): Promise<{ deletedMessages?: number; deletedBot?: number }> {
+  async purgeOldMessages(olderThanTimestamp: number): Promise<{ deletedMessages?: number; deletedBot?: number; deletedSeen?: number }> {
     const resMsg = this.db
       .prepare("DELETE FROM messages WHERE created_at < ?")
       .run(olderThanTimestamp);
     const resBot = this.db
       .prepare("DELETE FROM bot_messages WHERE created_at < ?")
       .run(olderThanTimestamp);
-    return { deletedMessages: Number(resMsg.changes), deletedBot: Number(resBot.changes) };
+    const resSeen = this.db
+      .prepare("DELETE FROM seen_messages WHERE seen_at < ?")
+      .run(olderThanTimestamp);
+    return { deletedMessages: Number(resMsg.changes), deletedBot: Number(resBot.changes), deletedSeen: Number(resSeen.changes) };
   }
 }

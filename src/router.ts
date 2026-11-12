@@ -16,10 +16,6 @@ import { formatAgentError } from "./utils/agent-error.js";
 import { typingDelayMs, sleep } from "./messenger/typing.js";
 import { humanReplyDelay } from "./messenger/send-pacing.js";
 
-/** IDs of incoming messages already handled (MQTT can redeliver the same
- *  message, which used to produce duplicate replies). Capped to bound memory. */
-const seenMessageIds = new Set<string>();
-
 /** Is the given message id a bot message? Checks bot_messages first; falls
  *  back to the messages table (a bot message sent before bot_messages
  *  recording, or by an external script, still shows the bot as its sender). */
@@ -174,11 +170,14 @@ export async function routeIncomingEvent(client: MessengerClient, event: Incomin
     return;
   }
 
-  // Dedup: MQTT can redeliver the same message; processing it twice used to
-  // send duplicate replies. Skip already-handled IDs.
-  if (seenMessageIds.has(messageID)) return;
-  seenMessageIds.add(messageID);
-  if (seenMessageIds.size > 1000) seenMessageIds.clear();
+  // Dedup: MQTT can redeliver the same message (especially around a
+  // reconnect), and processing it twice used to send duplicate replies.
+  // The claim lives in SQLite (seen_messages), not a RAM Set: the Set
+  // lost everything on restart and dropped ALL ids when it hit its 1000
+  // cap and cleared. Runs AFTER the message_attachments branch above —
+  // a late-attachments event shares its message's id and must never be
+  // mistaken for a duplicate.
+  if (!(await db.claimMessageSeen(messageID, threadID))) return;
 
   const currentBotUserId = client.getCurrentUserID();
   const ownerId = config.ownerId || currentBotUserId;
@@ -370,13 +369,27 @@ export async function routeIncomingEvent(client: MessengerClient, event: Incomin
     return;
   }
 
-  // 2. Fetch sender information & store message into D1 history
+  // 2. Fetch sender information & store message into history. The name
+  // cache (sender_names, fed by the sidecar member list) is checked
+  // first: under Go, message events carry ids only and getUserInfo
+  // returns {}, so without the cache history rows — and namesFromHistory
+  // for @mentions — end up nameless.
   let senderName: string | undefined;
   try {
-    const info = await client.getUserInfo(senderID);
-    senderName = info.name;
+    senderName = (await db.getSenderName(senderID)) || undefined;
   } catch {
-    // ignore
+    // ignore — fall through to getUserInfo
+  }
+  if (!senderName) {
+    try {
+      const info = await client.getUserInfo(senderID);
+      senderName = info.name;
+      if (senderName) {
+        await db.cacheSenderNames([{ senderId: senderID, name: senderName }]).catch(() => {});
+      }
+    } catch {
+      // ignore
+    }
   }
 
   await db.saveMessage({

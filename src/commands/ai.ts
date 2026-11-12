@@ -40,6 +40,20 @@ export const aiCommand: CommandHandler = async ({ client, event, args, rawText }
     return;
   }
 
+  // Save the question (without the `.ai` prefix) into history BEFORE
+  // runAgent: the router never saves dot-commands, so without this the
+  // question — and the turn it starts — vanishes from context entirely.
+  // The answer is recorded by the client's send path (recordOwnMessage).
+  await db.saveMessage({
+    id: messageID,
+    thread_id: threadID,
+    sender_id: senderID,
+    sender_name: "Owner",
+    body: question,
+    reply_to_id: event.messageReply?.messageID ?? null,
+    created_at: event.timestamp || Date.now(),
+  });
+
   // Instant visual feedback while the LLM thinks (fire-and-forget).
   // The emoji is picked from the question content (diverse, contextual).
   reactToTrigger(client, messageID, threadID, question);

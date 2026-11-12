@@ -108,6 +108,30 @@ const SCHEMA_STATEMENTS: string[] = [
     thread_id TEXT NOT NULL,
     created_at INTEGER NOT NULL
   )`,
+  // Durable dedup claims: every incoming message id the router has
+  // started processing. Replaces the old in-memory Set (which lost its
+  // contents on every restart, and dropped ALL ids when it hit its 1000
+  // cap and cleared). Purged with the retention job, same window as
+  // messages. A claim is about PROCESSING, not storage: a claimed id
+  // may have no row in messages (e.g. a dot-command, which is never
+  // saved to history).
+  `CREATE TABLE IF NOT EXISTS seen_messages (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    seen_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_seen_messages_time ON seen_messages(seen_at)`,
+  // Sender display-name cache: the sidecar's `members` command is the
+  // only source that reliably carries names under Go (message events
+  // carry ids only, and getUserInfo returns {}). Populated from member
+  // lists + fca getUserInfo results; read at save time so history rows
+  // carry a real name instead of null, and by namesFromHistory for
+  // @mentions. Names change rarely — last write wins, no expiry.
+  `CREATE TABLE IF NOT EXISTS sender_names (
+    sender_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`,
   // --- Former JSON files, now tables in the same file ---
   // Typing-indicator work mode per thread (was typing-modes.json).
   `CREATE TABLE IF NOT EXISTS typing_modes (

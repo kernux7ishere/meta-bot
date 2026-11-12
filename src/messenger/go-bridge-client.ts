@@ -697,11 +697,7 @@ class GoBridgeClientImpl implements GoBridgeClient {
           )
         );
         const otid = String(res.otid ?? "");
-        if (otid) {
-          await db.recordBotMessage(otid, threadID).catch((e) => {
-            logger.warn({ err: e.message, otid }, "Failed to record sent sticker message");
-          });
-        }
+        await this.recordOwnMessage(otid, threadID, "[sticker]");
         return otid;
       }
       text = message.body ?? "";
@@ -732,14 +728,44 @@ class GoBridgeClientImpl implements GoBridgeClient {
     if (mentionRefs && mentionRefs.length > 0) sendCmd.mentions = mentionRefs;
     const res = await pacedSend(() => this.sendCommand("send", sendCmd, SEND_TIMEOUT_MS));
     const otid = String(res.otid ?? "");
-    if (otid) {
-      // Register as a bot message (same as the fca client) so a later
-      // reply-to-bot check can find it.
-      await db.recordBotMessage(otid, threadID).catch((e) => {
-        logger.warn({ err: e.message, otid }, "Failed to record sent bot message");
-      });
-    }
+    await this.recordOwnMessage(otid, threadID, text, replyToMessageID);
     return otid;
+  }
+
+  /**
+   * Record a message this bot just sent, in BOTH stores: bot_messages
+   * (reply-to-bot lookup) and messages (the LLM's history). The sidecar
+   * returns an otid, not the real Facebook message id — the echo event
+   * carries the real id but no otid, so the two can never be reconciled
+   * here; the otid is the row's id. The reply-to-bot check still works
+   * because the sidecar reports the replied-to SENDER directly
+   * (ReplyToUserId), and only the fallback history lookup needs the
+   * real id. Never throws: a failed record must not fail a send that
+   * already succeeded.
+   */
+  private async recordOwnMessage(
+    otid: string,
+    threadID: string,
+    body: string,
+    replyToMessageID?: string
+  ): Promise<void> {
+    if (!otid) return;
+    await db.recordBotMessage(otid, threadID).catch((e) => {
+      logger.warn({ err: e.message, otid }, "Failed to record sent bot message");
+    });
+    await db
+      .saveMessage({
+        id: otid,
+        thread_id: threadID,
+        sender_id: this.currentUserId,
+        sender_name: "Luminous",
+        body,
+        reply_to_id: replyToMessageID ?? null,
+        created_at: Date.now(),
+      })
+      .catch((e) => {
+        logger.warn({ err: e.message, otid }, "Failed to save sent bot message to history");
+      });
   }
 
   /** Send a local file as a MEDIA attachment via the sidecar `send_file`
@@ -772,11 +798,19 @@ class GoBridgeClientImpl implements GoBridgeClient {
     if (replyToMessageID) sendCmd.reply_to = replyToMessageID;
     const res = await pacedSend(() => this.sendCommand("send_file", sendCmd, 120_000));
     const otid = String(res.otid ?? "");
-    if (otid) {
-      await db.recordBotMessage(otid, threadID).catch((e) => {
-        logger.warn({ err: e.message, otid }, "Failed to record sent bot file message");
-      });
-    }
+    // No caption means the history row would be an empty line — describe
+    // what was sent instead (the file itself is not in history).
+    const captionText = (caption ?? "").trim();
+    const body =
+      captionText ||
+      (mimeType.startsWith("image/")
+        ? "[ảnh]"
+        : mimeType.startsWith("video/")
+          ? "[video]"
+          : mimeType.startsWith("audio/")
+            ? "[audio]"
+            : `[file: ${filename || "file"}]`);
+    await this.recordOwnMessage(otid, threadID, body, replyToMessageID);
     return otid;
   }
 
@@ -788,12 +822,24 @@ class GoBridgeClientImpl implements GoBridgeClient {
     }
     const res = await this.sendCommand("members", { thread_id: tid }, 30_000);
     const members = Array.isArray(res.members) ? res.members : [];
-    return members
+    const result = members
       .map((m: any) => ({
         userID: String(m.user_id ?? ""),
         name: typeof m.name === "string" && m.name ? m.name : undefined,
       }))
       .filter((m: { userID: string }) => m.userID && m.userID !== "0");
+    // Feed the sender-name cache: the member list is the only source
+    // that reliably carries names under Go (message events carry ids
+    // only). Fire-and-forget — a cache failure must not fail the call.
+    const named = result
+      .filter((m) => m.name)
+      .map((m) => ({ senderId: m.userID, name: m.name as string }));
+    if (named.length > 0) {
+      void db.cacheSenderNames(named).catch((e) => {
+        logger.warn({ err: e.message }, "Failed to cache member names");
+      });
+    }
+    return result;
   }
 
   async sendTypingIndicator(threadID: string): Promise<() => void> {

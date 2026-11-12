@@ -72,6 +72,26 @@ export async function initMessenger(): Promise<MessengerClient> {
                 await db.recordBotMessage(sentId, threadID).catch((e) => {
                   logger.warn({ err: e.message, sentId }, "Failed to record sent bot message");
                 });
+                // And in history, as the bot's own turn: without this the
+                // LLM never sees what it said (fca returns the REAL
+                // message id here, unlike the Go sidecar's otid).
+                const rawBody = typeof message === "string" ? message : (message.body ?? "");
+                const historyBody =
+                  rawBody ||
+                  ((message as any)?.sticker ? "[sticker]" : (message as any)?.attachment ? "[tệp đính kèm]" : "");
+                await db
+                  .saveMessage({
+                    id: sentId,
+                    thread_id: threadID,
+                    sender_id: currentUserId,
+                    sender_name: "Luminous",
+                    body: historyBody,
+                    reply_to_id: replyToMessageID ?? null,
+                    created_at: Date.now(),
+                  })
+                  .catch((e) => {
+                    logger.warn({ err: e.message, sentId }, "Failed to save sent bot message to history");
+                  });
               }
 
               res(sentId || "");

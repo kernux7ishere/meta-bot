@@ -1,6 +1,7 @@
 import { CommandHandler } from "./types.js";
 import { db, resolveSelfThreadId } from "../db/index.js";
 import { getLlmClient } from "../llm/client.js";
+import { describeMessageBody } from "../prompt/assembler.js";
 import { config } from "../config.js";
 import { chunkText } from "../utils/text.js";
 import { logger } from "../utils/logger.js";
@@ -66,9 +67,11 @@ export const summaryCommand: CommandHandler = async ({ client, event, args }) =>
     const firstTime = new Date(messages[0].created_at).toLocaleString("vi-VN");
     const lastTime = new Date(messages[messages.length - 1].created_at).toLocaleString("vi-VN");
 
-    const conversationText = messages
-      .map((m) => `[${m.sender_name || `User_${m.sender_id.slice(-4)}`}]: ${m.body || ""}`)
-      .join("\n");
+    const conversationText = (
+      await Promise.all(
+        messages.map(async (m) => `[${m.sender_name || `User_${m.sender_id.slice(-4)}`}]: ${await describeMessageBody(threadID, m)}`)
+      )
+    ).join("\n");
 
     const prompt = `Bạn là trợ lý tổng hợp thông tin. Dưới đây là ${messages.length} tin nhắn gần nhất trong đoạn chat (từ ${firstTime} đến ${lastTime}).
 Hãy tóm tắt ngắn gọn các chủ đề chính được thảo luận, các quyết định/thống nhất quan trọng, và các công việc/deadline cần chú ý (nếu có).

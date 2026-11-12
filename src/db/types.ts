@@ -88,6 +88,18 @@ export interface DatabaseService {
   saveMessage(msg: MessageRecord): Promise<void>;
   getRecentMessages(threadId: string, limit?: number): Promise<MessageRecord[]>;
 
+  /** Claim an incoming message id as "being processed". Returns true on
+   *  first sight (caller proceeds), false when the id was already
+   *  claimed — the durable replacement for the old in-memory dedup Set
+   *  (lost on restart; cleared wholesale at its 1000-id cap). */
+  claimMessageSeen(messageId: string, threadId: string): Promise<boolean>;
+
+  /** Sender display-name cache (see sender_names in sqlite-conn.ts).
+   *  getSenderNames returns only the ids it knows, as a map. */
+  getSenderName(senderId: string): Promise<string | null>;
+  getSenderNames(senderIds: string[]): Promise<Map<string, string>>;
+  cacheSenderNames(entries: Array<{ senderId: string; name: string }>): Promise<void>;
+
   recordBotMessage(messageId: string, threadId: string): Promise<void>;
   isBotMessage(messageId: string): Promise<boolean>;
 
@@ -108,5 +120,5 @@ export interface DatabaseService {
   getPresenceEnabled(): Promise<boolean>;
   setPresenceEnabled(enabled: boolean): Promise<void>;
 
-  purgeOldMessages(olderThanTimestamp: number): Promise<{ deletedMessages?: number; deletedBot?: number }>;
+  purgeOldMessages(olderThanTimestamp: number): Promise<{ deletedMessages?: number; deletedBot?: number; deletedSeen?: number }>;
 }

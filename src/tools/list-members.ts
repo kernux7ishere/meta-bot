@@ -4,18 +4,29 @@ import { logger } from "../utils/logger.js";
 
 /** Build a sender_id -> display name map from recent thread history, so
  *  members the sidecar only knows by id still get a readable name.
- *  `excludeUserId` (the bot's own id) is skipped: the router used to save
- *  the bot's own messages with sender_name "Owner", which made the bot
- *  look like the Owner in the member list and made the agent @mention
- *  itself instead of the real Owner. */
+ *  Rows with no name fall back to the sender_names cache (fed by the
+ *  sidecar member list). `excludeUserId` (the bot's own id) is skipped:
+ *  the bot's own history rows carry sender_name "Luminous", and its id
+ *  must never be presented as a member to @mention. */
 export async function namesFromHistory(threadId: string, excludeUserId?: string): Promise<Map<string, string>> {
   const names = new Map<string, string>();
   try {
     const recent = await db.getRecentMessages(threadId, 200);
+    const nameless: string[] = [];
     for (const m of recent) {
-      if (!m.sender_id || !m.sender_name || names.has(m.sender_id)) continue;
+      if (!m.sender_id) continue;
       if (excludeUserId && m.sender_id === excludeUserId) continue;
-      names.set(m.sender_id, m.sender_name);
+      if (m.sender_name) {
+        if (!names.has(m.sender_id)) names.set(m.sender_id, m.sender_name);
+      } else if (!nameless.includes(m.sender_id)) {
+        nameless.push(m.sender_id);
+      }
+    }
+    if (nameless.length > 0) {
+      const cached = await db.getSenderNames(nameless).catch(() => new Map<string, string>());
+      for (const [id, name] of cached) {
+        if (!names.has(id)) names.set(id, name);
+      }
     }
   } catch (err: any) {
     logger.debug({ err: err.message, threadId }, "Could not load names from history");

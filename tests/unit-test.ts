@@ -1874,7 +1874,193 @@ async function runTests() {
     await go7.disconnect().catch(() => {});
   }
 
-  // §34 is the last section: no later code uses the suite's shared
+  // §35 — bot turns in history (2026-11-12 review): before this, the
+  // bot's messages were never saved and buildChatHistory forced every
+  // turn to role "user", so a reply to a bot message ("cái đó nghĩa là
+  // sao?") pointed at a message the LLM could not see. Bot sends are
+  // now recorded at send time (sender = bot id, sender_name "Luminous")
+  // and map to role "assistant"; `.ai <question>` is saved (without the
+  // prefix) because the router never saves dot-commands.
+  console.log("\n[35] Testing bot messages + .ai questions in history (assistant role)...");
+  const { buildChatHistory } = await import("../src/prompt/assembler.js");
+  const histThread = "thread-hist-35";
+  const now35 = Date.now();
+  await db.saveMessage({ id: "hist35-q1", thread_id: histThread, sender_id: "owner-123", sender_name: "Owner", body: "cái đó nghĩa là sao?", reply_to_id: "hist35-bot1", created_at: now35 - 2000 });
+  await db.saveMessage({ id: "hist35-bot1", thread_id: histThread, sender_id: "61596150664551", sender_name: "Luminous", body: "Mật ong tự nhiên gần như không bao giờ hỏng.", reply_to_id: null, created_at: now35 - 1000 });
+  const hist35 = await buildChatHistory(histThread, 20, "61596150664551");
+  if (hist35.length !== 2) throw new Error(`Expected 2 history turns, got ${hist35.length}`);
+  if (hist35[0].role !== "user" || !hist35[0].content.includes("cái đó nghĩa là sao?") || !hist35[0].content.includes("in reply to msg hist35-bot1")) {
+    throw new Error(`Owner question turn wrong: ${JSON.stringify(hist35[0])}`);
+  }
+  if (hist35[1].role !== "assistant" || !hist35[1].content.includes("Mật ong")) {
+    throw new Error(`Bot turn was not mapped to role assistant: ${JSON.stringify(hist35[1])}`);
+  }
+  // Without the bot id, nothing maps to assistant (graceful fallback).
+  const hist35NoBot = await buildChatHistory(histThread, 20);
+  if (hist35NoBot.some((h) => h.role === "assistant")) throw new Error("Without a bot id, no turn should map to assistant");
+  // Live path: a real send through the mock sidecar records the bot turn.
+  const go8 = await initGoBridge({
+    sidecarPath: process.execPath,
+    sidecarArgs: [mockSidecarPath],
+    autoRelogin: false,
+    maxRestarts: 3,
+    restartBaseDelayMs: 50,
+    restartMaxDelayMs: 200,
+  });
+  try {
+    const login8 = await go8.loginCookies({ c_user: "61596150664551", xs: "x", sb: "s", datr: "d" });
+    if (login8.userId !== 61596150664551) throw new Error("loginCookies failed in §35");
+    const liveThread = "123456789012345";
+    const otid35 = await go8.sendMessage("bot says hi", liveThread);
+    if (!otid35) throw new Error("sendMessage returned no otid");
+    const liveRows = await db.getRecentMessages(liveThread, 5);
+    const liveBot = liveRows.find((m) => m.id === otid35);
+    if (!liveBot || liveBot.sender_id !== "61596150664551" || liveBot.body !== "bot says hi") {
+      throw new Error(`Bot send was not recorded in messages: ${JSON.stringify(liveRows)}`);
+    }
+    const liveHist = await buildChatHistory(liveThread, 5, "61596150664551");
+    if (liveHist.length < 1 || liveHist[liveHist.length - 1].role !== "assistant") {
+      throw new Error("Live bot send was not an assistant turn in history");
+    }
+    // send_file with no caption records a placeholder body, not "".
+    const otidFile = await go8.sendFile("/tmp/cat.png", "cat.png", "image/png", liveThread);
+    const fileRows = await db.getRecentMessages(liveThread, 5);
+    const fileRow = fileRows.find((m) => m.id === otidFile);
+    if (!fileRow || fileRow.body !== "[ảnh]") throw new Error(`send_file without caption should record "[ảnh]", got: ${JSON.stringify(fileRow)}`);
+    // Sticker send records "[sticker]".
+    const otidSticker = await go8.sendMessage({ body: "", sticker: "369239263222822" } as any, liveThread);
+    const stickerRows = await db.getRecentMessages(liveThread, 5);
+    const stickerRow = stickerRows.find((m) => m.id === otidSticker);
+    if (!stickerRow || stickerRow.body !== "[sticker]") throw new Error(`Sticker send should record "[sticker]", got: ${JSON.stringify(stickerRow)}`);
+    console.log("✔ Bot history: seeded + live sends map to assistant, send_file/sticker get placeholder bodies.");
+  } finally {
+    await go8.disconnect().catch(() => {});
+  }
+  // .ai <question> is saved into history (the router never saves
+  // dot-commands). The LLM call fails on the dummy test key — that is
+  // fine; the save happens before runAgent runs.
+  const { aiCommand } = await import("../src/commands/ai.js");
+  const aiFakeClient: any = {
+    getCurrentUserID: () => "61596150664551",
+    sendMessage: async () => "x",
+    sendTypingIndicator: async () => () => {},
+    setMessageReaction: async () => {},
+    getThreadHistory: async () => [],
+    getUserInfo: async () => ({}),
+  };
+  await aiCommand({
+    client: aiFakeClient,
+    event: { type: "message", threadID: "thread-hist-35-ai", senderID: "owner-123", messageID: "hist35-ai-q1", body: ".ai cho thêm 1 fact", timestamp: Date.now() } as any,
+    args: ["cho", "thêm", "1", "fact"],
+    rawText: ".ai cho thêm 1 fact",
+  });
+  const aiRows = await db.getRecentMessages("thread-hist-35-ai", 5);
+  const aiQ = aiRows.find((m) => m.id === "hist35-ai-q1");
+  if (!aiQ || aiQ.body !== "cho thêm 1 fact" || aiQ.sender_name !== "Owner") {
+    throw new Error(`.ai question was not saved to history: ${JSON.stringify(aiRows)}`);
+  }
+  console.log("✔ .ai question: saved into history without the .ai prefix.");
+
+  // §36 — durable dedup (2026-11-12 review): the in-memory Set lost
+  // everything on restart and dropped ALL ids when it hit its 1000 cap
+  // and cleared. Claims now live in SQLite (seen_messages); a second
+  // claim of the same id returns false. saveMessage is ON CONFLICT DO
+  // UPDATE now, not INSERT OR REPLACE, so a re-save keeps its rowid
+  // (the created_at tie-break in getRecentMessages depends on it).
+  console.log("\n[36] Testing durable dedup (seen_messages claim + router)...");
+  if (!(await db.claimMessageSeen("dedup-36-a", "thread-dedup-36"))) throw new Error("First claim should succeed");
+  if (await db.claimMessageSeen("dedup-36-a", "thread-dedup-36")) throw new Error("Second claim of the same id should fail");
+  if (!(await db.claimMessageSeen("dedup-36-b", "thread-dedup-36"))) throw new Error("A different id should claim fine");
+  const { getConnection } = await import("../src/db/sqlite-conn.js");
+  await db.saveMessage({ id: "dedup-36-row", thread_id: "thread-dedup-36", sender_id: "1", body: "v1", created_at: 1000 });
+  const rowid1 = (getConnection().prepare("SELECT rowid AS r FROM messages WHERE id = ?").get("dedup-36-row") as any).r;
+  await db.saveMessage({ id: "dedup-36-row", thread_id: "thread-dedup-36", sender_id: "1", body: "v2", created_at: 1000 });
+  const rowid2 = (getConnection().prepare("SELECT rowid AS r FROM messages WHERE id = ?").get("dedup-36-row") as any).r;
+  if (rowid1 !== rowid2) throw new Error(`Re-saving a message changed its rowid (${rowid1} -> ${rowid2})`);
+  const rows36 = await db.getRecentMessages("thread-dedup-36", 10);
+  const row36 = rows36.find((m) => m.id === "dedup-36-row");
+  if (rows36.filter((m) => m.id === "dedup-36-row").length !== 1 || row36?.body !== "v2") {
+    throw new Error("Re-save did not upsert in place");
+  }
+  // Router level: the same owner command delivered twice runs once.
+  sentMessages = [];
+  const evt36: any = { type: "message", threadID: "thread-dedup-36", senderID: "owner-123", messageID: "dedup-36-cmd", body: ".ai on", timestamp: Date.now() };
+  await routeIncomingEvent(mockClient, evt36);
+  await routeIncomingEvent(mockClient, evt36);
+  if (sentMessages.length !== 1) throw new Error(`Duplicate delivery ran the command ${sentMessages.length} times, expected 1`);
+  console.log("✔ Durable dedup: DB claim blocks the second sight, re-save keeps rowid, duplicate delivery runs once.");
+
+  // §37 — placeholders for text-less messages (2026-11-12 review): a
+  // sticker/file-only message used to render as a blank `[User_1234]:`
+  // line. buildChatHistory now resolves the recorded attachment for
+  // the message ([ảnh] / [sticker] / [file: name] / [video] / [audio])
+  // and falls back to [tin nhắn trống]; normal text is untouched.
+  console.log("\n[37] Testing history placeholders for text-less messages...");
+  // recordAttachments is already imported in §24 — reuse that binding.
+  const phThread = "thread-ph-37";
+  const now37 = Date.now();
+  await db.saveMessage({ id: "ph-1", thread_id: phThread, sender_id: "111", sender_name: "A", body: "", created_at: now37 - 4000 });
+  recordAttachments(phThread, [{ url: "https://fbcdn.net/pic.jpg", type: "photo", name: "pic.jpg" }], "111", "ph-1");
+  await db.saveMessage({ id: "ph-2", thread_id: phThread, sender_id: "111", sender_name: "A", body: "", created_at: now37 - 3000 });
+  recordAttachments(phThread, [{ url: "https://fbcdn.net/sticker.webp", type: "sticker", name: "sticker 123" }], "111", "ph-2");
+  await db.saveMessage({ id: "ph-3", thread_id: phThread, sender_id: "111", sender_name: "A", body: "", created_at: now37 - 2000 });
+  recordAttachments(phThread, [{ url: "https://fbcdn.net/doc.pdf", type: "file", name: "report.pdf" }], "111", "ph-3");
+  await db.saveMessage({ id: "ph-4", thread_id: phThread, sender_id: "111", sender_name: "A", body: "", created_at: now37 - 1000 });
+  await db.saveMessage({ id: "ph-5", thread_id: phThread, sender_id: "111", sender_name: "A", body: "hello", created_at: now37 });
+  const phHist = await buildChatHistory(phThread, 20);
+  if (!phHist[0].content.includes("[ảnh]")) throw new Error(`Photo message should render [ảnh]: ${phHist[0].content}`);
+  if (!phHist[1].content.includes("[sticker]")) throw new Error(`Sticker message should render [sticker]: ${phHist[1].content}`);
+  if (!phHist[2].content.includes("[file: report.pdf]")) throw new Error(`File message should render [file: report.pdf]: ${phHist[2].content}`);
+  if (!phHist[3].content.includes("[tin nhắn trống]")) throw new Error(`Attachment-less empty message should render [tin nhắn trống]: ${phHist[3].content}`);
+  if (!phHist[4].content.includes("hello") || /\[ảnh\]|\[sticker\]|\[file:|\[tin nhắn trống\]/.test(phHist[4].content)) throw new Error(`Normal text must be untouched: ${phHist[4].content}`);
+  console.log("✔ Placeholders: photo/sticker/file/empty resolve correctly, normal text untouched.");
+
+  // §38 — sender-name cache (2026-11-12 review): message events carry
+  // ids only and getUserInfo returns {} under Go, so history rows were
+  // nameless and namesFromHistory (used for @mentions) broke. Names now
+  // come from the sidecar member list (the only reliable source) into
+  // sender_names; the router reads the cache before getUserInfo, and
+  // namesFromHistory falls back to it.
+  console.log("\n[38] Testing sender-name cache (members -> cache -> history)...");
+  await db.cacheSenderNames([{ senderId: "777", name: "Bạn Bảy" }]);
+  if ((await db.getSenderName("777")) !== "Bạn Bảy") throw new Error("getSenderName did not return the cached name");
+  if ((await db.getSenderName("no-such-id")) !== null) throw new Error("getSenderName should return null for an unknown id");
+  const batch38 = await db.getSenderNames(["777", "no-such-id"]);
+  if (batch38.get("777") !== "Bạn Bảy" || batch38.has("no-such-id")) throw new Error("getSenderNames batch lookup wrong");
+  await db.cacheSenderNames([{ senderId: "777", name: "Bạn Bảy Mới" }]);
+  if ((await db.getSenderName("777")) !== "Bạn Bảy Mới") throw new Error("Cache overwrite (last write wins) failed");
+  await db.cacheSenderNames([{ senderId: "888", name: "   " }]);
+  if ((await db.getSenderName("888")) !== null) throw new Error("Blank names must not be cached");
+  // namesFromHistory falls back to the cache for nameless rows.
+  const nhThread = "thread-names-38";
+  await db.saveMessage({ id: "nh-1", thread_id: nhThread, sender_id: "777", sender_name: null, body: "hello", created_at: Date.now() });
+  const { namesFromHistory } = await import("../src/tools/list-members.js");
+  const names38 = await namesFromHistory(nhThread);
+  if (names38.get("777") !== "Bạn Bảy Mới") throw new Error(`namesFromHistory did not use the cache: ${JSON.stringify([...names38])}`);
+  // Live path: getThreadMembers populates the cache from the roster.
+  const go9 = await initGoBridge({
+    sidecarPath: process.execPath,
+    sidecarArgs: [mockSidecarPath],
+    autoRelogin: false,
+    maxRestarts: 3,
+    restartBaseDelayMs: 50,
+    restartMaxDelayMs: 200,
+  });
+  try {
+    const login9 = await go9.loginCookies({ c_user: "61596150664551", xs: "x", sb: "s", datr: "d" });
+    if (login9.userId !== 61596150664551) throw new Error("loginCookies failed in §38");
+    const members9 = await go9.getThreadMembers("8835038716594816");
+    if (members9.length !== 3) throw new Error(`Expected 3 mock members, got ${members9.length}`);
+    await new Promise((r) => setTimeout(r, 50)); // cache write is fire-and-forget
+    if ((await db.getSenderName("61568473919027")) !== "Dương Tuấn Phong") {
+      throw new Error("getThreadMembers did not populate the sender-name cache");
+    }
+    console.log("✔ Sender-name cache: store/batch/overwrite/blank rules, namesFromHistory fallback, members feed.");
+  } finally {
+    await go9.disconnect().catch(() => {});
+  }
+
+  // §38 is the last section: no later code uses the suite's shared
   // connection, so the swapped-in test databases are simply closed.
   memDb.close();
   migDb.close();

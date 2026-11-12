@@ -3,6 +3,7 @@ import path from "node:path";
 import { db } from "../db/index.js";
 import { MessageRecord } from "../db/types.js";
 import { logger } from "../utils/logger.js";
+import { getAttachmentsByMessageId } from "../recent-attachments.js";
 
 let cachedSoul: string | null = null;
 let cachedUser: string | null = null;
@@ -78,18 +79,56 @@ export async function buildSystemPrompt(threadId: string): Promise<string> {
 
 export async function buildChatHistory(
   threadId: string,
-  historyLimit: number
+  historyLimit: number,
+  botUserId?: string
 ): Promise<Array<{ role: "user" | "assistant" | "system"; content: string; name?: string }>> {
   const messages: MessageRecord[] = await db.getRecentMessages(threadId, historyLimit);
 
-  return messages.map((m) => {
-    const isBot = false; // We format as user messages with sender headers so LLM knows who said what
+  // Bot turns map to role "assistant" so the model sees its own past
+  // answers (before 2026-11-12 the bot's messages were never saved at
+  // all, and everything was forced to role "user" — a reply to a bot
+  // message was then unanswerable: "(in reply to msg X)" pointed at a
+  // message that did not exist in the context).
+  const out: Array<{ role: "user" | "assistant" | "system"; content: string; name?: string }> = [];
+  for (const m of messages) {
+    const isBot = !!botUserId && m.sender_id === botUserId;
     const senderDisplay = m.sender_name || (m.sender_id ? `User_${m.sender_id.slice(-4)}` : "Unknown");
     const replyNote = m.reply_to_id ? ` (in reply to msg ${m.reply_to_id})` : "";
+    const text = await describeMessageBody(threadId, m);
+    out.push({
+      role: isBot ? "assistant" : "user",
+      content: `[${senderDisplay}${replyNote}]: ${text}`,
+    });
+  }
+  return out;
+}
 
-    return {
-      role: isBot ? ("assistant" as const) : ("user" as const),
-      content: `[${senderDisplay}${replyNote}]: ${m.body || ""}`,
-    };
-  });
+/**
+ * What a history row says when its text is empty: a sticker/file-only
+ * message otherwise renders as a blank `[User_1234]:` line and the LLM
+ * has nothing to work with. The row itself stores no attachment info,
+ * so resolve it from the recorded attachments (the message was recorded
+ * when it arrived); bot-sent files already carry their own placeholder
+ * body from the send path. Also used by .summary, which formats rows
+ * the same way.
+ */
+export async function describeMessageBody(threadId: string, m: MessageRecord): Promise<string> {
+  const body = (m.body || "").trim();
+  if (body) return m.body || "";
+  let atts: Array<{ type: string; name?: string }> = [];
+  try {
+    atts = await getAttachmentsByMessageId(threadId, m.id);
+  } catch {
+    // Attachment lookup must never break history building.
+  }
+  if (atts.length > 0) {
+    const a = atts[0];
+    const t = (a.type || "").toLowerCase();
+    if (t === "sticker") return "[sticker]";
+    if (t === "photo" || t === "image" || t === "animated_image") return "[ảnh]";
+    if (t === "video") return "[video]";
+    if (t === "audio") return "[audio]";
+    return a.name ? `[file: ${a.name}]` : "[file]";
+  }
+  return "[tin nhắn trống]";
 }

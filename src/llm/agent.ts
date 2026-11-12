@@ -48,7 +48,11 @@ export async function runAgent(options: AgentRunOptions): Promise<string> {
 
   const client = getLlmClient();
   const systemPrompt = await buildSystemPrompt(threadId);
-  const history = await buildChatHistory(threadId, config.historyLimit);
+  const history = await buildChatHistory(
+    threadId,
+    config.historyLimit,
+    messengerClient?.getCurrentUserID?.()
+  );
 
   // Construct current user turn
   let userTurnText = "";
