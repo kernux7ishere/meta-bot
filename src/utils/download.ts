@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fetchWithTimeout } from "./fetch-timeout.js";
+import { safeFetch } from "./safe-fetch.js";
 import { isSafeUrl } from "../llm/guards.js";
 
 export interface DownloadedFile {
@@ -52,7 +52,7 @@ export async function downloadToTempFile(
   if (!safe.safe) {
     throw new Error(`Refused unsafe URL: ${safe.reason}`);
   }
-  const res = await fetchWithTimeout(url, {
+  const res = await safeFetch(url, {
     headers: { "User-Agent": "Mozilla/5.0 (compatible; MessengerBot/1.0)" },
   });
   if (!res.ok) {

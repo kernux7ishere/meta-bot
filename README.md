@@ -50,7 +50,7 @@ Trỏ `GO_SIDECAR_PATH` trong `.env` tới binary đó, đặt `MESSENGER_CLIENT
 
 ```bash
 npm run build
-npm test        # bộ test đơn vị (§1–§31)
+npm test        # bộ test đơn vị (§1–§34)
 npm start       # chạy nền: systemd user service, xem src/index.ts
 ```
 

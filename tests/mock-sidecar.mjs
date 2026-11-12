@@ -86,6 +86,13 @@ rl.on("line", (line) => {
     }
     case "disconnect":
       return send({ event: "disconnected", ok: true, id });
+    case "emit_disconnected":
+      // Async socket-drop event (no id — it is not a command response).
+      send({ event: "disconnected", error: "test disconnect" });
+      return send({ event: "emit_disconnected", ok: true, id });
+    case "emit_connected":
+      send({ event: "connected" });
+      return send({ event: "emit_connected", ok: true, id });
     case "emit_message":
       send({
         event: "message",

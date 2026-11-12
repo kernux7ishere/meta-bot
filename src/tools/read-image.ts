@@ -2,6 +2,7 @@ import { AgentTool } from "./types.js";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { getLlmClient } from "../llm/client.js";
+import { safeFetch } from "../utils/safe-fetch.js";
 
 /** Detect a real image MIME type from file magic bytes (the upstream rejects
  *  the generic `image/*` it guesses when it fetches a URL itself). */
@@ -21,10 +22,16 @@ function detectImageMime(buf: Buffer, contentType: string | null): string {
  *  The LLM upstream cannot fetch Facebook CDN URLs reliably (it guesses
  *  mime `image/*`, which Gemini rejects), so the bot fetches the bytes. */
 async function urlToDataUri(url: string): Promise<string> {
-  const res = await fetch(url, {
-    signal: AbortSignal.timeout(20000),
-    headers: { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36" },
-  });
+  // SSRF-safe fetch: resolves + checks the host and every redirect hop
+  // (read_image was not covered by the guard's URL_TOOLS before — the
+  // fetch went out unchecked).
+  const res = await safeFetch(
+    url,
+    {
+      headers: { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36" },
+    },
+    20000
+  );
   if (!res.ok) throw new Error(`Image download failed: HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length === 0) throw new Error("Image download returned empty body");

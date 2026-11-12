@@ -85,6 +85,13 @@ export interface GoBridgeOptions {
   restartBaseDelayMs?: number;
   /** Cap for the restart delay (ms). Default 30000. */
   restartMaxDelayMs?: number;
+  /** How long the Messenger socket may stay down before the client
+   *  restarts the sidecar (ms). Default: config SIDECAR_SOCKET_DOWN_RESTART_MS (60000).
+   *  Only armed while logged in — before login the socket is down by
+   *  design. Covers the 2026-11-07 failure: a 401 disconnect with the
+   *  sidecar process still alive used to leave the bot deaf/mute until
+   *  someone restarted it by hand. */
+  socketDownRestartMs?: number;
 }
 
 export interface GoBridgeClient extends MessengerClient {
@@ -198,6 +205,7 @@ class GoBridgeClientImpl implements GoBridgeClient {
   private readonly maxRestarts: number;
   private readonly restartBaseDelayMs: number;
   private readonly restartMaxDelayMs: number;
+  private readonly socketDownRestartMs: number;
   private readonly stateDir: string | undefined;
 
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -213,6 +221,9 @@ class GoBridgeClientImpl implements GoBridgeClient {
   private restartTimer: NodeJS.Timeout | null = null;
   private stopping = false;
   private dead = false;
+  /** Messenger socket state (watchdog, §34). */
+  private socketConnected = false;
+  private socketDownTimer: NodeJS.Timeout | null = null;
 
   constructor(sidecarPath: string, options: GoBridgeOptions) {
     this.sidecarPath = sidecarPath;
@@ -221,6 +232,7 @@ class GoBridgeClientImpl implements GoBridgeClient {
     this.maxRestarts = options.maxRestarts ?? 10;
     this.restartBaseDelayMs = options.restartBaseDelayMs ?? 1000;
     this.restartMaxDelayMs = options.restartMaxDelayMs ?? 30_000;
+    this.socketDownRestartMs = options.socketDownRestartMs ?? config.socketDownRestartMs ?? 60_000;
     this.stateDir = options.stateDir || config.goSidecarStateDir || undefined;
   }
 
@@ -238,6 +250,7 @@ class GoBridgeClientImpl implements GoBridgeClient {
     const status = await this.getStatus().catch(() => null);
     if (status) {
       logger.info({ status }, "Go sidecar status");
+      if (status.connected) this.socketConnected = true;
       if (status.logged_in && status.user_id) {
         this.currentUserId = String(status.user_id);
         this.wasLoggedIn = true;
@@ -287,6 +300,7 @@ class GoBridgeClientImpl implements GoBridgeClient {
       this.stderrRl?.close();
       this.stdoutRl = null;
       this.stderrRl = null;
+      this.clearSocketDownTimer();
       this.rejectAllPending(new Error(`Go sidecar exited (code ${code ?? "?"}${signal ? `, signal ${signal}` : ""})`));
       if (this.stopping) {
         logger.info("Go sidecar stopped");
@@ -294,6 +308,43 @@ class GoBridgeClientImpl implements GoBridgeClient {
       }
       this.scheduleRestart();
     });
+  }
+
+  // ---------- socket watchdog (§34) ----------
+  // A crash restarts the sidecar (see scheduleRestart), but a socket
+  // disconnect with the process still alive does NOT — the bot used to
+  // sit deaf/mute after a 401 until someone restarted it by hand
+  // (2026-11-07). While logged in, a `disconnected` event arms a timer;
+  // a `connected` event clears it. If the socket stays down past the
+  // deadline, kill the sidecar — the exit handler then restarts it
+  // through the normal backoff path (bounded by maxRestarts).
+
+  private clearSocketDownTimer(): void {
+    if (this.socketDownTimer) {
+      clearTimeout(this.socketDownTimer);
+      this.socketDownTimer = null;
+    }
+  }
+
+  private armSocketDownTimer(): void {
+    this.clearSocketDownTimer();
+    if (this.stopping || this.dead || this.socketDownRestartMs <= 0) return;
+    this.socketDownTimer = setTimeout(() => this.onSocketDownTooLong(), this.socketDownRestartMs);
+  }
+
+  private onSocketDownTooLong(): void {
+    this.socketDownTimer = null;
+    if (this.stopping || this.dead || this.socketConnected) return;
+    logger.error(
+      { downMs: this.socketDownRestartMs },
+      "Go sidecar socket stayed down too long, restarting the sidecar"
+    );
+    const child = this.child;
+    if (!child) return; // already restarting via the exit path
+    child.kill("SIGTERM");
+    setTimeout(() => {
+      if (this.child === child && !child.killed) child.kill("SIGKILL");
+    }, 2000);
   }
 
   private scheduleRestart(): void {
@@ -358,6 +409,7 @@ class GoBridgeClientImpl implements GoBridgeClient {
 
   async disconnect(): Promise<void> {
     this.stopping = true;
+    this.clearSocketDownTimer();
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
@@ -566,9 +618,16 @@ class GoBridgeClientImpl implements GoBridgeClient {
         return;
       }
       case "connected":
+        this.socketConnected = true;
+        this.clearSocketDownTimer();
         logger.info("Go sidecar: Messenger socket connected");
         return;
       case "disconnected":
+        this.socketConnected = false;
+        // Only armed while logged in: before login the socket is down
+        // by design, and a restart then would kill a healthy sidecar
+        // waiting for credentials.
+        if (this.wasLoggedIn) this.armSocketDownTimer();
         logger.warn({ error: evt.error || "" }, "Go sidecar: Messenger socket disconnected");
         return;
       case "logged_in":

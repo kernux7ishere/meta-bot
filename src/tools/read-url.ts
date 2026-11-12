@@ -2,7 +2,7 @@ import { AgentTool } from "./types.js";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { truncate } from "../utils/text.js";
-import { fetchWithTimeout } from "../utils/fetch-timeout.js";
+import { safeFetch } from "../utils/safe-fetch.js";
 import { isSafeUrl } from "../llm/guards.js";
 
 /** Per-fetch cap so a stalled page can't silence the bot. */
@@ -44,7 +44,7 @@ export const readUrlTool: AgentTool = {
     try {
       // 1. Fetch through Jina Reader (https://r.jina.ai/<url>)
       const jinaUrl = `${config.jinaReaderUrl}${url}`;
-      const res = await fetchWithTimeout(
+      const res = await safeFetch(
         jinaUrl,
         {
           headers: {
@@ -63,8 +63,8 @@ export const readUrlTool: AgentTool = {
         }
       }
 
-      // 2. Fallback to direct fetch
-      const directRes = await fetchWithTimeout(
+      // 2. Fallback to direct fetch (SSRF-safe: host + redirects checked)
+      const directRes = await safeFetch(
         url,
         {
           headers: {

@@ -20,9 +20,11 @@
  *  - Memory writes (remember): the highest-risk persistent action — a
  *    poisoned memory affects every future conversation. Blocked on any
  *    secret, injection pattern, or (when tainted) URL in the note.
- *  - URL fetches (read_url / send_image / send_file / reverse_image_search):
- *    SSRF guard — private / loopback / link-local / metadata addresses
- *    and non-http(s) schemes are refused.
+ *  - URL fetches (read_url / read_image / read_file / send_image /
+ *    send_file / reverse_image_search): SSRF guard — private /
+ *    loopback / link-local / metadata addresses and non-http(s)
+ *    schemes are refused at the guard, and safeFetch re-checks the
+ *    resolved addresses plus every redirect hop at fetch time.
  *  - The final answer: scanned for secrets before it is sent to the
  *    thread (secret redaction, Hermes-style).
  *
@@ -33,18 +35,25 @@
  * established.
  */
 
+import { isUnsafeIp, stripIpBrackets } from "../utils/ip-safety.js";
+
 export interface GuardVerdict {
   allowed: boolean;
   /** Short, safe reason (never contains the secret/injection text itself). */
   reason?: string;
 }
 
-/** Tools that write persistent state or send content out of the bot. */
-const WRITE_TOOLS = new Set(["remember", "record_fact", "send_image", "send_file", "send_sticker"]);
+/** Tools that write persistent state or send content out of the bot.
+ *  send_message / remind are here too: their text goes straight to the
+ *  thread (now or later), so an instruction smuggled into untrusted
+ *  content must not be able to steer them either. */
+const WRITE_TOOLS = new Set(["remember", "record_fact", "send_image", "send_file", "send_sticker", "send_message", "remind"]);
 
 /** Tools that fetch a URL supplied (directly or indirectly) by the LLM. */
 const URL_TOOLS: Record<string, string[]> = {
   read_url: ["url"],
+  read_image: ["url"],
+  read_file: ["url"],
   send_image: ["url"],
   send_file: ["url"],
   reverse_image_search: ["image_url"],
@@ -127,10 +136,13 @@ export function findInjection(text: string): string[] {
 
 /**
  * SSRF guard for URLs the agent wants to fetch (Hermes-style URL safety).
- * Refuses: non-http(s) schemes, localhost, loopback, private RFC1918,
- * link-local (incl. the 169.254.169.254 cloud metadata endpoint), and
- * 0.0.0.0. Public hostnames are allowed (DNS resolution is the fetcher's
- * job); IP-literal hosts are checked directly.
+ * String-level only: refuses non-http(s) schemes, the localhost name,
+ * and IP-literal hosts that classify as non-public (loopback, private
+ * RFC1918, link-local incl. the 169.254.169.254 cloud metadata endpoint,
+ * CGNAT, documentation, multicast, reserved — v4, v6, and IPv4 embedded
+ * in IPv6). Public hostnames are allowed here — DNS resolution is the
+ * fetcher's job (safeFetch resolves and checks every answer); this is
+ * the cheap pre-check that runs before any tool executes.
  */
 export function isSafeUrl(raw: string): { safe: boolean; reason?: string } {
   let url: URL;
@@ -143,23 +155,20 @@ export function isSafeUrl(raw: string): { safe: boolean; reason?: string } {
     return { safe: false, reason: `scheme ${url.protocol} is not allowed` };
   }
   const host = url.hostname.toLowerCase();
-  if (host === "localhost" || host === "0.0.0.0" || host === "[::1]" || host === "::1") {
-    return { safe: false, reason: "localhost/loopback is not allowed" };
+  if (host === "localhost") {
+    return { safe: false, reason: "localhost is not allowed" };
   }
-  // IPv4 literal checks
-  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (ipv4) {
-    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
-    if (a === 10) return { safe: false, reason: "private network (10/8) is not allowed" };
-    if (a === 172 && b >= 16 && b <= 31) return { safe: false, reason: "private network (172.16/12) is not allowed" };
-    if (a === 192 && b === 168) return { safe: false, reason: "private network (192.168/16) is not allowed" };
-    if (a === 127) return { safe: false, reason: "loopback (127/8) is not allowed" };
-    if (a === 169 && b === 254) return { safe: false, reason: "link-local (169.254/16, incl. cloud metadata) is not allowed" };
-    if (a === 0) return { safe: false, reason: "0.0.0.0/8 is not allowed" };
-  }
-  // IPv6 loopback / unique-local
-  if (host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80")) {
-    return { safe: false, reason: "private/loopback IPv6 is not allowed" };
+  // IP-literal hosts. URL.hostname keeps the brackets on IPv6 literals
+  // ("[fe80::1]") — strip them first, or the prefix checks below never
+  // match (that bug used to let [fe80::1] / [fd00::1] /
+  // [::ffff:127.0.0.1] through). WHATWG URL parsing already normalises
+  // decimal/hex/octal IPv4 spellings to dotted-quad, so the classifier
+  // sees the real address.
+  const bare = stripIpBrackets(host);
+  const isLiteral = /^(\d{1,3}\.){3}\d{1,3}$/.test(bare) || bare.includes(":");
+  if (isLiteral) {
+    const check = isUnsafeIp(bare);
+    if (check.unsafe) return { safe: false, reason: `${check.reason} is not allowed` };
   }
   return { safe: true };
 }

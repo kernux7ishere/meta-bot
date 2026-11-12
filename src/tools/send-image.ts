@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { AgentTool } from "./types.js";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
-import { fetchWithTimeout } from "../utils/fetch-timeout.js";
+import { safeFetch } from "../utils/safe-fetch.js";
 import { downloadToTempFile, removeTempFile } from "../utils/download.js";
 import { getSentImageUrls, recordSentImage } from "../sent-images.js";
 
@@ -21,7 +21,7 @@ async function searchCommonsImages(query: string, limit = 5): Promise<CommonsIma
     "https://commons.wikimedia.org/w/api.php?action=query&generator=search" +
     `&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=${limit}` +
     "&prop=imageinfo&iiprop=url%7Cmime&format=json";
-  const res = await fetchWithTimeout(apiUrl, {
+  const res = await safeFetch(apiUrl, {
     headers: { "User-Agent": "MessengerBot/1.0 (contact: userbot)" },
   });
   if (!res.ok) {

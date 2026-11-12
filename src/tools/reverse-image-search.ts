@@ -1,6 +1,7 @@
 import { AgentTool } from "./types.js";
 import { logger } from "../utils/logger.js";
-import { fetchWithTimeout } from "../utils/fetch-timeout.js";
+import { safeFetch } from "../utils/safe-fetch.js";
+import { wrapSearchResults } from "./search-web.js";
 
 interface ReverseImageResult {
   /** Exact/near-exact copies of the image found elsewhere (best for finding the source). */
@@ -68,7 +69,7 @@ function parseYandexResults(html: string): ReverseImageResult {
 export async function reverseImageSearchYandex(imageUrl: string): Promise<ReverseImageResult> {
   const searchUrl =
     "https://yandex.com/images/search?rpt=imageview&url=" + encodeURIComponent(imageUrl);
-  const res = await fetchWithTimeout(searchUrl, {
+  const res = await safeFetch(searchUrl, {
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -143,6 +144,8 @@ export const reverseImageSearchTool: AgentTool = {
     if (result.duplicates.length === 0 && result.similar.length === 0) {
       return "Không tìm thấy ảnh này hay ảnh tương tự ở đâu cả. Có thể đây là ảnh chế cá nhân / ảnh ghép, không có nguồn công khai.";
     }
-    return lines.join("\n");
+    // Titles/URLs come from a scraped Yandex page — untrusted data, same
+    // marker as search_web.
+    return wrapSearchResults(lines.join("\n"));
   },
 };

@@ -32,6 +32,11 @@ export const config = {
   messengerClient: getEnv("MESSENGER_CLIENT", "fca").toLowerCase(),
   goSidecarPath: getEnv("GO_SIDECAR_PATH", ""),
   goSidecarStateDir: getEnv("GO_SIDECAR_STATE_DIR", ""),
+  // Socket watchdog (§34): while logged in, a Messenger socket that stays
+  // down longer than this (ms) makes the client restart the sidecar —
+  // otherwise a 401 disconnect with the process alive leaves the bot
+  // deaf/mute until a manual restart. 0 disables the watchdog.
+  socketDownRestartMs: getEnvNumber("SIDECAR_SOCKET_DOWN_RESTART_MS", 60_000),
 
   // LLM
   llm: {

@@ -7,6 +7,17 @@ import { fetchWithTimeout } from "../utils/fetch-timeout.js";
 /** Per-provider fetch cap so a stalled search backend fails fast. */
 const SEARCH_TIMEOUT_MS = 20000;
 
+/**
+ * Wrap search results so the LLM treats them as untrusted data — the
+ * same marker read_url / read_file / read_image already use. Search
+ * results used to reach the agent unwrapped, so an injected snippet
+ * looked like any other context. Error / "no results" strings are NOT
+ * wrapped (they are not untrusted content).
+ */
+export function wrapSearchResults(text: string): string {
+  return `[UNTRUSTED SEARCH RESULTS START]\n${text}\n[UNTRUSTED SEARCH RESULTS END]`;
+}
+
 export const searchWebTool: AgentTool = {
   definition: {
     type: "function",
@@ -56,7 +67,7 @@ export const searchWebTool: AgentTool = {
             const formatted = results
               .map((r: any, idx: number) => `[${idx + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet || r.content || ""}`)
               .join("\n\n");
-            return truncate(formatted, 2500);
+            return wrapSearchResults(truncate(formatted, 2500));
           }
         } else {
           logger.warn({ status: res.status }, "OmniRoute search returned non-OK, trying Tavily");
@@ -93,7 +104,7 @@ export const searchWebTool: AgentTool = {
             .map((r: any, idx: number) => `[${idx + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.content}`)
             .join("\n\n");
 
-          return truncate(formatted, 2500);
+          return wrapSearchResults(truncate(formatted, 2500));
         }
       } catch (err: any) {
         logger.warn({ err: err.message }, "Tavily search failed, checking Brave");
@@ -124,7 +135,7 @@ export const searchWebTool: AgentTool = {
             .map((r: any, idx: number) => `[${idx + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.description}`)
             .join("\n\n");
 
-          return truncate(formatted, 2500);
+          return wrapSearchResults(truncate(formatted, 2500));
         }
       } catch (err: any) {
         logger.warn({ err: err.message }, "Brave search failed");
@@ -139,7 +150,7 @@ export const searchWebTool: AgentTool = {
         const data = (await res.json()) as any;
         const text = data.AbstractText || data.Answer || "";
         if (text) {
-          return `Instant Answer: ${text}\nSource: ${data.AbstractURL || "DuckDuckGo"}`;
+          return wrapSearchResults(`Instant Answer: ${text}\nSource: ${data.AbstractURL || "DuckDuckGo"}`);
         }
       }
     } catch {

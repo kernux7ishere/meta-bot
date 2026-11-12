@@ -1,6 +1,7 @@
 import { AgentTool } from "./types.js";
 import { logger } from "../utils/logger.js";
 import { truncate } from "../utils/text.js";
+import { safeFetch } from "../utils/safe-fetch.js";
 import mammoth from "mammoth";
 import { createRequire } from "node:module";
 
@@ -39,7 +40,9 @@ export const readFileTool: AgentTool = {
     logger.info({ url, fileType }, "Executing read_file");
 
     try {
-      const res = await fetch(url);
+      // SSRF-safe fetch (read_file used to fetch the raw URL with no
+      // timeout and no URL check at all).
+      const res = await safeFetch(url, {}, 20000);
       if (!res.ok) {
         return `Failed to download file: HTTP ${res.status} ${res.statusText}`;
       }
