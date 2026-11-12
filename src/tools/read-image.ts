@@ -3,12 +3,43 @@ import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { getLlmClient } from "../llm/client.js";
 
+/** Detect a real image MIME type from file magic bytes (the upstream rejects
+ *  the generic `image/*` it guesses when it fetches a URL itself). */
+function detectImageMime(buf: Buffer, contentType: string | null): string {
+  if (contentType && /^image\/(jpeg|png|gif|webp|bmp|avif)$/i.test(contentType.trim())) {
+    return contentType.trim().toLowerCase();
+  }
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+  if (buf.length >= 6 && buf.toString("ascii", 0, 6).startsWith("GIF8")) return "image/gif";
+  if (buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return "image/bmp";
+  return "image/jpeg";
+}
+
+/** Download an image URL to a base64 data URI with a concrete MIME type.
+ *  The LLM upstream cannot fetch Facebook CDN URLs reliably (it guesses
+ *  mime `image/*`, which Gemini rejects), so the bot fetches the bytes. */
+async function urlToDataUri(url: string): Promise<string> {
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(20000),
+    headers: { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36" },
+  });
+  if (!res.ok) throw new Error(`Image download failed: HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length === 0) throw new Error("Image download returned empty body");
+  if (buf.length > 10 * 1024 * 1024) throw new Error("Image is larger than 10 MB");
+  const mime = detectImageMime(buf, res.headers.get("content-type"));
+  return `data:${mime};base64,${buf.toString("base64")}`;
+}
+
 export const readImageTool: AgentTool = {
   definition: {
     type: "function",
     function: {
       name: "read_image",
-      description: "Analyze, understand, or extract text from an image provided via URL or attachment.",
+      description:
+        "Analyze, understand, or extract text from an image provided via URL or attachment. A Messenger sticker IS an image — when the user asks about a sticker (or a photo) sent in this thread, call this with that sticker/photo's URL from the message context. Use it to describe, read, or transcribe any image or sticker the user refers to.",
       parameters: {
         type: "object",
         properties: {
@@ -42,6 +73,10 @@ export const readImageTool: AgentTool = {
     try {
       const client = getLlmClient();
 
+      // Fetch the image ourselves and send it as base64 with a concrete
+      // MIME type (the upstream cannot fetch fbcdn URLs reliably).
+      const imageUrl = url.startsWith("data:") ? url : await urlToDataUri(url);
+
       const response = await client.chat.completions.create({
         model: config.llm.model,
         messages: [
@@ -55,7 +90,7 @@ export const readImageTool: AgentTool = {
               {
                 type: "image_url",
                 image_url: {
-                  url: url,
+                  url: imageUrl,
                 },
               },
             ],

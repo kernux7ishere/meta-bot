@@ -8,14 +8,21 @@
  * - POST /memory/:threadId            -> Set memory content { content: string }
  * - POST /messages                    -> Save message { id, thread_id, sender_id, sender_name, body, reply_to_id, created_at }
  * - GET  /messages/:threadId?limit=20 -> Get latest messages in thread
- * - GET  /style/:threadId             -> Get thread style { thread_id, content, auto_learn, owner_msgs_since_learn, access_mode, sources, updated_at }
- * - POST /style/:threadId             -> Set thread style { content?, auto_learn?, owner_msgs_since_learn?, access_mode?, sources? }
+ * - GET  /style/:threadId             -> Get thread style { thread_id, content, auto_learn, owner_msgs_since_learn, access_mode, sources, active_persona, updated_at }
+ * - POST /style/:threadId             -> Set thread style { content?, auto_learn?, owner_msgs_since_learn?, access_mode?, sources?, active_persona? }
+ * - GET  /personas/:threadId          -> List named personas for a thread { thread_id, personas: [{ name, content, sources, created_at, updated_at }] }
+ * - POST /personas/:threadId/:name    -> Save/upsert a named persona { content, sources? }
+ * - GET  /personas/:threadId/:name    -> Get one named persona
+ * - DELETE /personas/:threadId/:name  -> Delete a named persona
  * - GET  /access/global                -> Get global blacklist { blacklist: string[] }
  * - POST /access/global               -> Ban/unban globally { action: 'ban'|'unban', user_id: string }
  * - GET  /access/:threadId            -> Get access lists { thread_id, access_mode, whitelist: string[], blacklist: string[], global_blacklist: string[] }
  * - POST /access/:threadId            -> Add/remove/set { action: 'mode'|'add'|'remove', mode?: string, user_id?: string, list_type?: 'white'|'black' }
  * - POST /bot-messages                -> Register bot sent message { id, thread_id, created_at }
  * - GET  /bot-messages/:id            -> Check if a message id was sent by the bot
+ * - GET  /self-thread                 -> Get the owner's self-chat thread id { threadId: string | null }
+ * - POST /self-thread                 -> Set the owner's self-chat thread id { threadId: string }
+ * - POST /migrate                       -> Create all tables (run once after first deploy)
  * - POST /purge                       -> Purge messages older than timestamp { older_than: number }
  */
 
@@ -217,7 +224,7 @@ export default {
 
         if (method === "GET") {
           const row = await env.DB.prepare(
-            "SELECT thread_id, content, auto_learn, owner_msgs_since_learn, access_mode, sources, updated_at FROM thread_style WHERE thread_id = ?"
+            "SELECT thread_id, content, auto_learn, owner_msgs_since_learn, access_mode, sources, active_persona, updated_at FROM thread_style WHERE thread_id = ?"
           )
             .bind(threadId)
             .first<{
@@ -227,6 +234,7 @@ export default {
               owner_msgs_since_learn: number;
               access_mode: string;
               sources: string;
+              active_persona: string;
               updated_at: number;
             }>();
 
@@ -244,6 +252,7 @@ export default {
             owner_msgs_since_learn: row ? row.owner_msgs_since_learn : 0,
             access_mode: row?.access_mode || "off",
             sources: parsedSources,
+            active_persona: row?.active_persona || "default",
             updated_at: row?.updated_at || null,
           });
         }
@@ -255,16 +264,17 @@ export default {
             owner_msgs_since_learn?: number;
             access_mode?: "off" | "whitelist" | "blacklist";
             sources?: string[];
+            active_persona?: string;
           };
 
           const now = Date.now();
 
           // Fetch existing row first if present to allow partial updates
           const existing = await env.DB.prepare(
-            "SELECT content, auto_learn, owner_msgs_since_learn, access_mode, sources FROM thread_style WHERE thread_id = ?"
+            "SELECT content, auto_learn, owner_msgs_since_learn, access_mode, sources, active_persona FROM thread_style WHERE thread_id = ?"
           )
             .bind(threadId)
-            .first<{ content: string; auto_learn: number; owner_msgs_since_learn: number; access_mode: string; sources: string }>();
+            .first<{ content: string; auto_learn: number; owner_msgs_since_learn: number; access_mode: string; sources: string; active_persona: string }>();
 
           const newContent = body.content !== undefined ? String(body.content) : existing?.content || "";
           const newAutoLearn =
@@ -278,19 +288,22 @@ export default {
             body.sources !== undefined
               ? JSON.stringify(body.sources)
               : existing?.sources || "[]";
+          const newActivePersona =
+            body.active_persona !== undefined ? String(body.active_persona) : existing?.active_persona || "default";
 
           await env.DB.prepare(`
-            INSERT INTO thread_style (thread_id, content, auto_learn, owner_msgs_since_learn, access_mode, sources, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO thread_style (thread_id, content, auto_learn, owner_msgs_since_learn, access_mode, sources, active_persona, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_id) DO UPDATE SET
               content = excluded.content,
               auto_learn = excluded.auto_learn,
               owner_msgs_since_learn = excluded.owner_msgs_since_learn,
               access_mode = excluded.access_mode,
               sources = excluded.sources,
+              active_persona = excluded.active_persona,
               updated_at = excluded.updated_at
           `)
-            .bind(threadId, newContent, newAutoLearn, newCounter, newAccessMode, newSources, now)
+            .bind(threadId, newContent, newAutoLearn, newCounter, newAccessMode, newSources, newActivePersona, now)
             .run();
 
           let parsedReturnSources: string[] = [];
@@ -308,8 +321,89 @@ export default {
             owner_msgs_since_learn: newCounter,
             access_mode: newAccessMode,
             sources: parsedReturnSources,
+            active_persona: newActivePersona,
             updated_at: now,
           });
+        }
+      }
+
+      // 4.5b. Personas: named answer styles learned via .learn.
+      // 'default' is virtual (no row) and means base behaviour.
+      if (path.startsWith("/personas/")) {
+        const rest = path.slice("/personas/".length);
+        const [threadIdEnc, nameEnc] = rest.split("/");
+        const threadId = decodeURIComponent(threadIdEnc || "");
+        const name = nameEnc !== undefined ? decodeURIComponent(nameEnc) : "";
+        if (!threadId) return errorResponse("Thread ID is required");
+
+        // List all personas for a thread
+        if (method === "GET" && !name) {
+          const { results } = await env.DB.prepare(
+            "SELECT name, content, sources, created_at, updated_at FROM personas WHERE thread_id = ? ORDER BY updated_at DESC"
+          )
+            .bind(threadId)
+            .all<{ name: string; content: string; sources: string; created_at: number; updated_at: number }>();
+          return jsonResponse({
+            thread_id: threadId,
+            personas: (results || []).map((r) => {
+              let sources: string[] = [];
+              try {
+                sources = r.sources ? JSON.parse(r.sources) : [];
+              } catch {
+                sources = [];
+              }
+              return { name: r.name, content: r.content, sources, created_at: r.created_at, updated_at: r.updated_at };
+            }),
+          });
+        }
+
+        if (!name) return errorResponse("Persona name is required");
+        if (name === "default") return errorResponse("'default' is a virtual persona and cannot be saved or deleted", 400);
+
+        // Get one persona
+        if (method === "GET") {
+          const row = await env.DB.prepare(
+            "SELECT name, content, sources, created_at, updated_at FROM personas WHERE thread_id = ? AND name = ?"
+          )
+            .bind(threadId, name)
+            .first<{ name: string; content: string; sources: string; created_at: number; updated_at: number }>();
+          if (!row) return errorResponse(`Persona '${name}' not found`, 404);
+          let sources: string[] = [];
+          try {
+            sources = row.sources ? JSON.parse(row.sources) : [];
+          } catch {
+            sources = [];
+          }
+          return jsonResponse({ thread_id: threadId, name: row.name, content: row.content, sources, created_at: row.created_at, updated_at: row.updated_at });
+        }
+
+        // Save / upsert a persona
+        if (method === "POST") {
+          const body = (await request.json()) as { content?: string; sources?: string[] };
+          const now = Date.now();
+          const content = String(body.content ?? "");
+          const sources = JSON.stringify(Array.isArray(body.sources) ? body.sources : []);
+          await env.DB.prepare(`
+            INSERT INTO personas (thread_id, name, content, sources, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id, name) DO UPDATE SET
+              content = excluded.content,
+              sources = excluded.sources,
+              updated_at = excluded.updated_at
+          `)
+            .bind(threadId, name, content, sources, now, now)
+            .run();
+          return jsonResponse({ success: true, thread_id: threadId, name, content, sources: JSON.parse(sources), updated_at: now });
+        }
+
+        // Delete a persona
+        if (method === "DELETE") {
+          const info = await env.DB.prepare(
+            "DELETE FROM personas WHERE thread_id = ? AND name = ?"
+          )
+            .bind(threadId, name)
+            .run();
+          return jsonResponse({ success: true, deleted: info.meta.changes > 0 });
         }
       }
 
@@ -507,6 +601,54 @@ export default {
           .run();
 
         return jsonResponse({ success: true, deleted_messages: resMsg.meta, deleted_bot: resBot.meta });
+      }
+
+      // Self-chat thread id (set via `.self set`), persisted so it survives
+      // restarts. Stored in the `settings` table (key/value).
+      if (path === "/self-thread") {
+        if (method === "POST") {
+          const body = (await request.json()) as { threadId: string };
+          if (!body.threadId) return errorResponse("threadId is required");
+          await env.DB.prepare(
+            "INSERT INTO settings (key, value) VALUES ('self_thread_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+          )
+            .bind(body.threadId)
+            .run();
+          return jsonResponse({ ok: true });
+        }
+        if (method === "GET") {
+          const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'self_thread_id'").first<{ value: string }>();
+          return jsonResponse({ threadId: row?.value || null });
+        }
+      }
+
+      // Create all tables (run once after first deploy).
+      if (path === "/migrate" && method === "POST") {
+        const statements = [
+          "CREATE TABLE IF NOT EXISTS threads (thread_id TEXT PRIMARY KEY, ai_enabled INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS memory (thread_id TEXT PRIMARY KEY, content TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS thread_style (thread_id TEXT PRIMARY KEY, content TEXT NOT NULL DEFAULT '', auto_learn INTEGER NOT NULL DEFAULT 0, owner_msgs_since_learn INTEGER NOT NULL DEFAULT 0, access_mode TEXT NOT NULL DEFAULT 'off', sources TEXT NOT NULL DEFAULT '[]', active_persona TEXT NOT NULL DEFAULT 'default', updated_at INTEGER NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS personas (thread_id TEXT NOT NULL, name TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', sources TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (thread_id, name))",
+          "CREATE TABLE IF NOT EXISTS access_global (user_id TEXT PRIMARY KEY, list_type TEXT NOT NULL DEFAULT 'black', created_at INTEGER NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS access_list (thread_id TEXT NOT NULL, user_id TEXT NOT NULL, list_type TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (thread_id, user_id))",
+          "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sender_id TEXT NOT NULL, sender_name TEXT, body TEXT, reply_to_id TEXT, created_at INTEGER NOT NULL)",
+          "CREATE INDEX IF NOT EXISTS idx_messages_thread_time ON messages(thread_id, created_at DESC)",
+          "CREATE TABLE IF NOT EXISTS bot_messages (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, created_at INTEGER NOT NULL)",
+          "CREATE INDEX IF NOT EXISTS idx_bot_messages_thread ON bot_messages(thread_id, created_at DESC)",
+          "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        ];
+        for (const sql of statements) {
+          await env.DB.prepare(sql).run();
+        }
+        // Existing databases (created before personas): add the column if
+        // it is missing. Fails with "duplicate column name" when already
+        // present — that is expected and safe to ignore.
+        try {
+          await env.DB.prepare("ALTER TABLE thread_style ADD COLUMN active_persona TEXT NOT NULL DEFAULT 'default'").run();
+        } catch {
+          // Column already exists.
+        }
+        return jsonResponse({ ok: true });
       }
 
       return errorResponse("Endpoint not found", 404);

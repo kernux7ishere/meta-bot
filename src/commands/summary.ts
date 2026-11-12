@@ -1,8 +1,8 @@
 import { CommandHandler } from "./types.js";
-import { db } from "../db/index.js";
+import { db, resolveSelfThreadId } from "../db/index.js";
 import { getLlmClient } from "../llm/client.js";
 import { config } from "../config.js";
-import { chunkText, sleep, getRandomDelay } from "../utils/text.js";
+import { chunkText } from "../utils/text.js";
 import { logger } from "../utils/logger.js";
 
 export const summaryCommand: CommandHandler = async ({ client, event, args }) => {
@@ -39,8 +39,9 @@ export const summaryCommand: CommandHandler = async ({ client, event, args }) =>
   if (destinationType === "here") {
     targetThreadId = threadID;
   } else {
-    // Default to SELF_THREAD_ID
-    if (!config.selfThreadId) {
+    // Default to SELF_THREAD_ID (.env first, then the D1-persisted `.self set`).
+    const selfId = await resolveSelfThreadId();
+    if (!selfId) {
       await client.sendMessage(
         " Chưa cấu hình SELF_THREAD_ID! Vui lòng cấu hình trong file .env hoặc vào đoạn chat riêng của bạn và gõ '.self set'.",
         threadID,
@@ -48,18 +49,16 @@ export const summaryCommand: CommandHandler = async ({ client, event, args }) =>
       );
       return;
     }
-    targetThreadId = config.selfThreadId;
+    targetThreadId = selfId;
   }
 
-  const stopTyping = await client.sendTypingIndicator(threadID);
-
+  // No typing indicator, no artificial delay: speed first.
   try {
     // Fetch messages from current thread
     // NOTE: Summaries are not filtered by access lists (per spec)
     const messages = await db.getRecentMessages(threadID, count);
 
     if (messages.length === 0) {
-      stopTyping();
       await client.sendMessage("Chưa có lịch sử tin nhắn để tóm tắt cho nhóm này.", threadID, messageID);
       return;
     }
@@ -85,8 +84,6 @@ ${conversationText}`;
       max_tokens: 800,
     });
 
-    stopTyping();
-
     const summary = completion.choices[0]?.message?.content?.trim() || "Không thể tạo tóm tắt.";
 
     // Prefix summary appropriately
@@ -99,11 +96,9 @@ ${conversationText}`;
 
     const chunks = chunkText(fullSummaryText);
     for (let i = 0; i < chunks.length; i++) {
-      if (i > 0) await sleep(500);
       await client.sendMessage(chunks[i], targetThreadId, destinationType === "here" && i === 0 ? messageID : undefined);
     }
   } catch (err: any) {
-    stopTyping();
     logger.error({ err: err.message, threadID }, "Error in .summary command");
     await client.sendMessage(`Đã xảy ra lỗi khi tạo tóm tắt: ${err.message}`, threadID, messageID);
   }

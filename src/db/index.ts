@@ -2,12 +2,14 @@ import {
   AccessListData,
   DatabaseService,
   MessageRecord,
+  Persona,
   ThreadSettings,
   ThreadStyle,
 } from "./types.js";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { consolidateMemory } from "../llm/consolidation.js";
+import { SqliteDatabaseClient } from "./sqlite.js";
 
 export class GatewayDatabaseClient implements DatabaseService {
   private baseUrl: string;
@@ -92,6 +94,7 @@ export class GatewayDatabaseClient implements DatabaseService {
         ...data,
         sources: Array.isArray(data.sources) ? data.sources : [],
         access_mode: data.access_mode || "off",
+        active_persona: data.active_persona || "default",
       };
     } catch (err: any) {
       logger.warn({ err: err.message, threadId }, "Failed to get thread style");
@@ -102,6 +105,7 @@ export class GatewayDatabaseClient implements DatabaseService {
         owner_msgs_since_learn: 0,
         access_mode: "off",
         sources: [],
+        active_persona: "default",
         updated_at: null,
       };
     }
@@ -115,17 +119,85 @@ export class GatewayDatabaseClient implements DatabaseService {
       owner_msgs_since_learn?: number;
       access_mode?: "off" | "whitelist" | "blacklist";
       sources?: string[];
+      active_persona?: string;
     }
   ): Promise<ThreadStyle> {
     const data = await this.request<ThreadStyle>(`/style/${encodeURIComponent(threadId)}`, {
       method: "POST",
       body: JSON.stringify(updates),
     });
-    return {
+    const style: ThreadStyle = {
       ...data,
       sources: Array.isArray(data.sources) ? data.sources : [],
       access_mode: data.access_mode || "off",
+      active_persona: data.active_persona || "default",
     };
+    // Keep the active named persona in sync: any content learned while a
+    // persona is active (via .persona save, .persona add, or auto-learn) is written
+    // back to that persona's row, so switching away and back keeps it.
+    if (updates.content !== undefined && style.active_persona !== "default") {
+      try {
+        await this.savePersona(threadId, style.active_persona, style.content, style.sources);
+      } catch (err: any) {
+        logger.warn({ err: err.message, threadId, persona: style.active_persona }, "Failed to sync active persona");
+      }
+    }
+    return style;
+  }
+
+  async getPersonas(threadId: string): Promise<Persona[]> {
+    try {
+      const data = await this.request<{ personas: Persona[] }>(`/personas/${encodeURIComponent(threadId)}`);
+      return Array.isArray(data.personas) ? data.personas : [];
+    } catch (err: any) {
+      logger.warn({ err: err.message, threadId }, "Failed to list personas");
+      return [];
+    }
+  }
+
+  async getPersona(threadId: string, name: string): Promise<Persona | null> {
+    try {
+      const data = await this.request<Persona>(
+        `/personas/${encodeURIComponent(threadId)}/${encodeURIComponent(name)}`
+      );
+      return data;
+    } catch (err: any) {
+      if (/404/.test(err.message || "")) return null;
+      logger.warn({ err: err.message, threadId, name }, "Failed to get persona");
+      return null;
+    }
+  }
+
+  async savePersona(
+    threadId: string,
+    name: string,
+    content: string,
+    sources: string[] = []
+  ): Promise<Persona> {
+    const data = await this.request<Persona>(
+      `/personas/${encodeURIComponent(threadId)}/${encodeURIComponent(name)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ content, sources }),
+      }
+    );
+    return {
+      ...data,
+      sources: Array.isArray(data.sources) ? data.sources : [],
+    };
+  }
+
+  async deletePersona(threadId: string, name: string): Promise<boolean> {
+    try {
+      const data = await this.request<{ deleted: boolean }>(
+        `/personas/${encodeURIComponent(threadId)}/${encodeURIComponent(name)}`,
+        { method: "DELETE" }
+      );
+      return Boolean(data.deleted);
+    } catch (err: any) {
+      logger.warn({ err: err.message, threadId, name }, "Failed to delete persona");
+      return false;
+    }
   }
 
   async getAccessList(threadId: string): Promise<AccessListData> {
@@ -233,6 +305,45 @@ export class GatewayDatabaseClient implements DatabaseService {
     }
   }
 
+  async getSelfThreadId(): Promise<string | null> {
+    try {
+      const data = await this.request<{ threadId: string | null }>("/self-thread");
+      return data.threadId || null;
+    } catch (err: any) {
+      logger.warn({ err: err.message }, "Failed to get self thread id");
+      return null;
+    }
+  }
+
+  async setSelfThreadId(threadId: string): Promise<void> {
+    await this.request<{ ok: boolean }>("/self-thread", {
+      method: "POST",
+      body: JSON.stringify({ threadId }),
+    });
+  }
+
+  // Typing mode + presence never lived in D1 (the worker has no columns
+  // for them) — they live in the local SQLite file even when the gateway
+  // is the active backend, so a rollback to D1 keeps them working.
+  // See src/db/sqlite.ts (typing_modes table, settings table).
+  private local = new SqliteDatabaseClient();
+
+  async getTypingMode(threadId: string): Promise<"user" | "bot"> {
+    return this.local.getTypingMode(threadId);
+  }
+
+  async setTypingMode(threadId: string, mode: "user" | "bot"): Promise<void> {
+    await this.local.setTypingMode(threadId, mode);
+  }
+
+  async getPresenceEnabled(): Promise<boolean> {
+    return this.local.getPresenceEnabled();
+  }
+
+  async setPresenceEnabled(enabled: boolean): Promise<void> {
+    await this.local.setPresenceEnabled(enabled);
+  }
+
   async purgeOldMessages(olderThanTimestamp: number): Promise<{ deletedMessages?: number; deletedBot?: number }> {
     try {
       const res = await this.request<any>("/purge", {
@@ -254,6 +365,7 @@ export class GatewayDatabaseClient implements DatabaseService {
 export class InMemoryDatabase implements DatabaseService {
   private threads = new Map<string, boolean>();
   private memory = new Map<string, string>();
+  private typingModes = new Map<string, "user" | "bot">();
   private styles = new Map<
     string,
     {
@@ -262,13 +374,17 @@ export class InMemoryDatabase implements DatabaseService {
       owner_msgs_since_learn: number;
       access_mode: "off" | "whitelist" | "blacklist";
       sources: string[];
+      active_persona: string;
       updated_at: number;
     }
   >();
+  private personas = new Map<string, Map<string, Persona>>();
   private accessLists = new Map<string, Map<string, "white" | "black">>();
   private globalBlacklist = new Set<string>();
   private messages: MessageRecord[] = [];
   private botMessages = new Set<string>();
+  private selfThreadId: string | null = null;
+  private presenceEnabled = true;
 
   async getThreadSettings(threadId: string): Promise<ThreadSettings> {
     return {
@@ -302,6 +418,7 @@ export class InMemoryDatabase implements DatabaseService {
       owner_msgs_since_learn: s ? s.owner_msgs_since_learn : 0,
       access_mode: s ? s.access_mode : "off",
       sources: s && Array.isArray(s.sources) ? s.sources : [],
+      active_persona: s ? s.active_persona || "default" : "default",
       updated_at: s ? s.updated_at : null,
     };
   }
@@ -314,6 +431,7 @@ export class InMemoryDatabase implements DatabaseService {
       owner_msgs_since_learn?: number;
       access_mode?: "off" | "whitelist" | "blacklist";
       sources?: string[];
+      active_persona?: string;
     }
   ): Promise<ThreadStyle> {
     const existing = this.styles.get(threadId) || {
@@ -322,6 +440,7 @@ export class InMemoryDatabase implements DatabaseService {
       owner_msgs_since_learn: 0,
       access_mode: "off" as const,
       sources: [] as string[],
+      active_persona: "default",
       updated_at: Date.now(),
     };
     const updated = {
@@ -333,13 +452,59 @@ export class InMemoryDatabase implements DatabaseService {
           : existing.owner_msgs_since_learn,
       access_mode: updates.access_mode !== undefined ? updates.access_mode : existing.access_mode,
       sources: updates.sources !== undefined ? updates.sources : existing.sources,
+      active_persona: updates.active_persona !== undefined ? updates.active_persona : existing.active_persona,
       updated_at: Date.now(),
     };
     this.styles.set(threadId, updated);
+    // Keep the active named persona in sync (same rule as the gateway client).
+    if (updates.content !== undefined && updated.active_persona !== "default") {
+      await this.savePersona(threadId, updated.active_persona, updated.content, updated.sources);
+    }
     return {
       thread_id: threadId,
       ...updated,
     };
+  }
+
+  async getPersonas(threadId: string): Promise<Persona[]> {
+    const map = this.personas.get(threadId);
+    if (!map) return [];
+    return Array.from(map.values()).sort((a, b) => b.updated_at - a.updated_at);
+  }
+
+  async getPersona(threadId: string, name: string): Promise<Persona | null> {
+    return this.personas.get(threadId)?.get(name) || null;
+  }
+
+  async savePersona(
+    threadId: string,
+    name: string,
+    content: string,
+    sources: string[] = []
+  ): Promise<Persona> {
+    let map = this.personas.get(threadId);
+    if (!map) {
+      map = new Map<string, Persona>();
+      this.personas.set(threadId, map);
+    }
+    const now = Date.now();
+    const existing = map.get(name);
+    const persona: Persona = {
+      thread_id: threadId,
+      name,
+      content,
+      sources,
+      created_at: existing ? existing.created_at : now,
+      updated_at: now,
+    };
+    map.set(name, persona);
+    return persona;
+  }
+
+  async deletePersona(threadId: string, name: string): Promise<boolean> {
+    const map = this.personas.get(threadId);
+    if (!map) return false;
+    return map.delete(name);
   }
 
   async getAccessList(threadId: string): Promise<AccessListData> {
@@ -415,6 +580,33 @@ export class InMemoryDatabase implements DatabaseService {
     return this.botMessages.has(messageId);
   }
 
+  async getSelfThreadId(): Promise<string | null> {
+    return this.selfThreadId;
+  }
+
+  async setSelfThreadId(threadId: string): Promise<void> {
+    this.selfThreadId = threadId;
+  }
+
+  async getTypingMode(threadId: string): Promise<"user" | "bot"> {
+    return this.typingModes.get(threadId) || "bot";
+  }
+
+  async setTypingMode(threadId: string, mode: "user" | "bot"): Promise<void> {
+    this.typingModes.set(threadId, mode);
+  }
+
+  // In-memory only (DB_BACKEND=memory, tests/dev): no file backing
+  // anymore — the live bot runs on SQLite, so nothing here needs to
+  // survive a restart.
+  async getPresenceEnabled(): Promise<boolean> {
+    return this.presenceEnabled;
+  }
+
+  async setPresenceEnabled(enabled: boolean): Promise<void> {
+    this.presenceEnabled = enabled;
+  }
+
   async purgeOldMessages(olderThanTimestamp: number): Promise<{ deletedMessages?: number; deletedBot?: number }> {
     const initial = this.messages.length;
     this.messages = this.messages.filter((m) => m.created_at >= olderThanTimestamp);
@@ -422,14 +614,64 @@ export class InMemoryDatabase implements DatabaseService {
   }
 }
 
+/**
+ * Pick the storage backend from DB_BACKEND (default `sqlite`):
+ * - `sqlite`  — local SQLite file (bot.db), the store since 2026-11-11.
+ * - `gateway` — Cloudflare D1 via the Worker gateway (rollback only;
+ *   needs GATEWAY_URL + GATEWAY_TOKEN). Typing mode + presence still
+ *   come from the local SQLite file in this mode (they never lived in
+ *   D1).
+ * - `memory`  — in-memory only, for tests/dev; nothing persists.
+ *
+ * SQLite open failures throw — the bot must NEVER silently fall back
+ * to in-memory (that would look like working while losing data).
+ */
 export function createDatabaseClient(): DatabaseService {
-  if (config.gateway.url && config.gateway.token) {
+  const backend = (config.database.backend || "sqlite").toLowerCase();
+
+  if (backend === "gateway") {
+    if (!config.gateway.url || !config.gateway.token) {
+      throw new Error(
+        "DB_BACKEND=gateway but GATEWAY_URL/GATEWAY_TOKEN are not set in .env"
+      );
+    }
     logger.info({ url: config.gateway.url }, "Using Cloudflare D1 Gateway Database");
     return new GatewayDatabaseClient();
   }
 
-  logger.warn("No GATEWAY_URL or GATEWAY_TOKEN provided; falling back to InMemoryDatabase");
-  return new InMemoryDatabase();
+  if (backend === "memory") {
+    logger.warn("DB_BACKEND=memory: using InMemoryDatabase, nothing persists across restarts");
+    return new InMemoryDatabase();
+  }
+
+  if (backend === "sqlite") {
+    try {
+      const client = new SqliteDatabaseClient();
+      logger.info(
+        { path: config.database.sqlitePath },
+        "Using local SQLite database"
+      );
+      return client;
+    } catch (err: any) {
+      throw new Error(
+        `Failed to open the SQLite database (${config.database.sqlitePath}): ${err?.message || err}. ` +
+          "Refusing to fall back to in-memory storage — fix the file or set DB_BACKEND=gateway to roll back to D1."
+      );
+    }
+  }
+
+  throw new Error(`Unknown DB_BACKEND "${backend}" (expected sqlite | gateway | memory)`);
 }
 
 export const db = createDatabaseClient();
+
+/** Resolve the owner's self-chat thread id: SELF_THREAD_ID from .env first,
+ *  then the D1-persisted value set via `.self set` (survives restarts). */
+export async function resolveSelfThreadId(): Promise<string | null> {
+  if (config.selfThreadId) return config.selfThreadId;
+  try {
+    return await db.getSelfThreadId();
+  } catch {
+    return null;
+  }
+}

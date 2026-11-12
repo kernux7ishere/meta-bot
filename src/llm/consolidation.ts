@@ -25,7 +25,8 @@ ${rawNotes}`;
       model: config.llm.model,
       messages: [{ role: "user", content: prompt }],
       temperature: 0.2,
-      max_tokens: 600,
+      // Provider rejects small max_tokens (400 below ~700); keep 1000.
+      max_tokens: 1000,
     });
 
     const consolidated = completion.choices[0]?.message?.content?.trim();

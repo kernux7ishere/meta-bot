@@ -4,3 +4,10 @@ dist/
 appstate.json
 *.log
 .wrangler/
+# Local SQLite store (all live bot data) + WAL sidecars — never commit,
+# never include in deploy tars (the live file stays on the box).
+bot.db
+bot.db-wal
+bot.db-shm
+# Bot -> Cloudflare gateway auth token (secret) — never commit.
+.gateway-token-new

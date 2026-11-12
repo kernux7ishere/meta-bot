@@ -1,6 +1,6 @@
-# Facebook Messenger AI Userbot (Agent)
+# Luminous
 
-Một Facebook Messenger **Userbot** (chạy trực tiếp trên tài khoản cá nhân của chủ sở hữu) cung cấp khả năng trò chuyện AI trong các nhóm chat và cuộc hội thoại cá nhân. Kiến trúc được thiết kế theo dạng **Agent** (lấy cảm hứng từ Hermes Agent của Nous Research): bộ nhớ dài hạn qua Cloudflare D1, hỗ trợ Function Calling (công cụ), và tương thích mọi LLM chuẩn OpenAI API (GPT-4o, Claude, Gemini, DeepSeek, Ollama,...).
+Một Facebook Messenger **Userbot** (chạy trực tiếp trên tài khoản cá nhân của chủ sở hữu) cung cấp khả năng trò chuyện AI trong các nhóm chat và cuộc hội thoại cá nhân. Kiến trúc được thiết kế theo dạng **Agent** (lấy cảm hứng từ Hermes Agent của Nous Research): bộ nhớ dài hạn, hỗ trợ Function Calling (công cụ), và tương thích mọi LLM chuẩn OpenAI API (GPT-4o, Claude, Gemini, DeepSeek, Ollama,...).
 
 Mặc định phản hồi bằng ngôn ngữ của tin nhắn gửi đến (chủ yếu là **Tiếng Việt** tự nhiên).
 

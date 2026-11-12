@@ -8,4 +8,4 @@ compatibility_date = "2024-11-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "messenger-userbot-db"
-database_id = "your-d1-database-id-here"
+database_id = "bbcbe13c-bf6a-437d-a043-f015feb80338"

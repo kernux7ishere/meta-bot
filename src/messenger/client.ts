@@ -1,12 +1,19 @@
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { IncomingEvent, MessengerClient } from "./types.js";
 import { db } from "../db/index.js";
+import { isStandardReaction } from "./reaction-picker.js";
+import { pacedSend } from "./send-pacing.js";
 
-// @dongdev/fca-unofficial is a CommonJS module
-// @ts-ignore
-import loginDefault from "@dongdev/fca-unofficial";
+// @dongdev/fca-unofficial ships both ESM (dist/index.mjs) and CJS (dist/cjs.cjs).
+// The ESM bundle is broken in plain Node: its bundler shim throws
+// 'Dynamic require of "util" is not supported' at load time. Load the CJS
+// entry via createRequire instead (uses the package's `require` condition).
+const require = createRequire(import.meta.url);
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const loginDefault = require("@dongdev/fca-unofficial");
 
 export async function initMessenger(): Promise<MessengerClient> {
   const loginFn = typeof loginDefault === "function" ? loginDefault : (loginDefault as any).default;
@@ -47,10 +54,13 @@ export async function initMessenger(): Promise<MessengerClient> {
         },
 
         async sendMessage(message, threadID, replyToMessageID): Promise<string> {
-          return new Promise<string>((res, rej) => {
-            const msgPayload = typeof message === "string" ? { body: message } : message;
+          // Outbound pacing (anti-checkpoint): never fire message bursts.
+          return pacedSend(
+            () =>
+              new Promise<string>((res, rej) => {
+                const msgPayload = typeof message === "string" ? { body: message } : message;
 
-            api.sendMessage(msgPayload, threadID, async (sendErr: any, messageInfo: any) => {
+                api.sendMessage(msgPayload, threadID, async (sendErr: any, messageInfo: any) => {
               if (sendErr) {
                 logger.error({ sendErr, threadID }, "Failed to send message");
                 return rej(sendErr);
@@ -66,24 +76,53 @@ export async function initMessenger(): Promise<MessengerClient> {
 
               res(sentId || "");
             }, replyToMessageID);
-          });
+              })
+          );
         },
 
         async sendTypingIndicator(threadID: string): Promise<() => void> {
+          // dongdev signature: sendTypingIndicator(threadID, isTyping, options, callback).
+          // isTyping=true starts typing. Messenger's client hides the indicator
+          // ~5s after the last typing event, so a single send only shows ~5s —
+          // it must be re-sent every few seconds to stay visible. Use
+          // autoStop:false (no server-side auto-stop) and refresh every 3s;
+          // stop explicitly with isTyping=false when done.
+          const startOpts = { duration: 60000, autoStop: false };
+          const stop = async () => {
+            try {
+              await api.sendTypingIndicator(threadID, false);
+            } catch {}
+          };
           try {
-            const endTyping = api.sendTypingIndicator(threadID);
-            return () => {
-              try {
-                if (typeof endTyping === "function") {
-                  endTyping();
-                }
-              } catch {
-                // ignore
-              }
-            };
-          } catch {
+            await api.sendTypingIndicator(threadID, true, startOpts);
+          } catch (err) {
+            logger.warn({ err, threadID }, "sendTypingIndicator failed");
             return () => {};
           }
+          const keepAlive = setInterval(() => {
+            api.sendTypingIndicator(threadID, true, startOpts).catch(() => {});
+          }, 3000);
+          let stopped = false;
+          return () => {
+            if (stopped) return;
+            stopped = true;
+            clearInterval(keepAlive);
+            stop();
+          };
+        },
+
+        async setMessageReaction(reaction: string, messageID: string, threadID: string): Promise<void> {
+          // Standard Facebook reactions; anything else is a custom emoji.
+          const forceCustom = !isStandardReaction(reaction);
+          return new Promise<void>((res, rej) => {
+            api.setMessageReaction(reaction, messageID, threadID, (err: any) => {
+              if (err) {
+                logger.error({ err, reaction, messageID }, "Failed to set message reaction");
+                return rej(err);
+              }
+              res();
+            }, forceCustom);
+          });
         },
 
         async getUserInfo(userID: string): Promise<{ name?: string }> {

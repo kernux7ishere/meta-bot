@@ -1,5 +1,6 @@
 import { CommandHandler } from "./types.js";
 import { config } from "../config.js";
+import { db, resolveSelfThreadId } from "../db/index.js";
 
 export const selfCommand: CommandHandler = async ({ client, event, args }) => {
   const { threadID, messageID, senderID } = event;
@@ -12,9 +13,11 @@ export const selfCommand: CommandHandler = async ({ client, event, args }) => {
 
   const subCommand = args[0]?.toLowerCase();
 
-  // .self set
+  // .self set — persist in D1 so it survives restarts, and update the
+  // in-memory config so it takes effect immediately.
   if (subCommand === "set") {
     config.selfThreadId = threadID;
+    await db.setSelfThreadId(threadID);
     await client.sendMessage(
       ` Đã đặt SELF_THREAD_ID thành công: ${threadID}. Các thông báo và tóm tắt cá nhân sẽ gửi về đây.`,
       threadID,
@@ -25,7 +28,7 @@ export const selfCommand: CommandHandler = async ({ client, event, args }) => {
 
   // .self show
   if (subCommand === "show") {
-    const currentSelf = config.selfThreadId || "(Chưa cấu hình)";
+    const currentSelf = (await resolveSelfThreadId()) || "(Chưa cấu hình)";
     await client.sendMessage(` SELF_THREAD_ID hiện tại: ${currentSelf}`, threadID, messageID);
     return;
   }

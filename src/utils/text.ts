@@ -57,16 +57,8 @@ export function truncate(text: string, maxLength: number): string {
 }
 
 /**
- * Sleep for a random jitter duration to look natural
+ * Sleep for a given number of milliseconds.
  */
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export function getRandomDelay(
-  min: number = config.minDelayMs,
-  max: number = config.maxDelayMs
-): number {
-  if (min >= max) return min;
-  return Math.floor(Math.random() * (max - min + 1)) + min;
 }

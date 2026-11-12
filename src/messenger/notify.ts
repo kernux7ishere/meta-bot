@@ -1,5 +1,6 @@
 import { MessengerClient } from "./types.js";
 import { config } from "../config.js";
+import { resolveSelfThreadId } from "../db/index.js";
 import { logger } from "../utils/logger.js";
 
 /**
@@ -7,7 +8,7 @@ import { logger } from "../utils/logger.js";
  * Never sends notifications to group threads.
  */
 export async function sendSelfNotification(client: MessengerClient, message: string): Promise<boolean> {
-  const selfId = config.selfThreadId;
+  const selfId = await resolveSelfThreadId();
   if (!selfId) {
     logger.warn({ message }, "Cannot send self notification: SELF_THREAD_ID is not configured");
     return false;

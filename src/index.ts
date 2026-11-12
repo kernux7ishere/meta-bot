@@ -1,5 +1,7 @@
 import { initMessenger } from "./messenger/client.js";
+import { initGoBridge } from "./messenger/go-bridge-client.js";
 import { routeIncomingEvent } from "./router.js";
+import { restoreReminders } from "./scheduler/reminders.js";
 import { logger } from "./utils/logger.js";
 import { config } from "./config.js";
 import { db } from "./db/index.js";
@@ -11,6 +13,7 @@ async function main() {
   logger.info("=========================================");
   logger.info({
     ownerId: config.ownerId || "(auto-detected from appstate)",
+    messengerClient: config.messengerClient,
     llmModel: config.llm.model,
     historyLimit: config.historyLimit,
     maxToolCalls: config.llm.maxToolCalls,
@@ -30,9 +33,28 @@ async function main() {
   }, 12 * 60 * 60 * 1000);
 
   try {
-    const client = await initMessenger();
+    // MESSENGER_CLIENT=go uses the Go sidecar (mautrix/meta) for both
+    // regular groups and E2EE DMs; anything else uses fca-unofficial.
+    const useGo = config.messengerClient === "go";
+    const client = useGo ? await initGoBridge() : await initMessenger();
 
-    logger.info("Bot listening for events... Press Ctrl+C to exit.");
+    // Apply the stored "Active now" choice (bot.db, default on).
+    // Fire-and-forget: the sidecar defaults to active and reports on
+    // (re)connect anyway, so a slow/failed apply here only matters
+    // when the owner turned presence off — and the sidecar's report
+    // waits up to 30 s for the socket, so it still lands. Never block
+    // startup on presence.
+    if (typeof client.setPresence === "function") {
+      db.getPresenceEnabled()
+        .then((enabled) => client.setPresence!(enabled))
+        .catch((err) => logger.warn({ err: err?.message }, "Applying stored presence failed"));
+    }
+
+    // Restore pending scheduled reminders (they survive restarts via
+    // bot.db; overdue ones fire immediately).
+    restoreReminders(client);
+
+    logger.info(`Bot listening for events (client: ${useGo ? "go-sidecar" : "fca"})... Press Ctrl+C to exit.`);
 
     const stopListening = client.listen((err, event) => {
       if (err) {
@@ -57,9 +79,13 @@ async function main() {
     });
 
     // Graceful shutdown handling
-    const shutdown = () => {
+    const shutdown = async () => {
       logger.info("Shutting down gracefully...");
       stopListening();
+      // Go bridge stops its sidecar process; the fca client omits this.
+      await client.disconnect?.().catch((e) => {
+        logger.warn({ err: e?.message }, "Client disconnect failed during shutdown");
+      });
       process.exit(0);
     };
 

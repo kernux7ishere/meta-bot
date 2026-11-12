@@ -1,7 +1,7 @@
 {
-  "name": "messenger-ai-userbot",
+  "name": "luminous",
   "version": "1.0.0",
-  "description": "Facebook Messenger AI Userbot with Cloudflare D1 persistent memory, tool use, and multi-model LLM support",
+  "description": "Luminous — Facebook Messenger AI userbot with persistent memory, tool use, and multi-model LLM support",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
